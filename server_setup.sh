@@ -20,7 +20,7 @@ die()     { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 #  1. ПЕРЕМЕННЫЕ — измени при необходимости
 # ============================================================
 NEW_USER="allison"
-SSH_PORT=8080          # порт SSH
+SSH_PORT=8833          # порт SSH
 
 # Публичный ключ: укажи прямо здесь или оставь пустым — скрипт спросит
 SSH_PUBKEY=""
@@ -44,7 +44,7 @@ info "Настройка UFW..."
 ufw --force enable
 ufw allow OpenSSH          # временно, пока не переключимся на новый порт
 
-ufw allow 8080/tcp
+ufw allow 2222/tcp
 ufw allow "${SSH_PORT}/tcp"
 ufw allow 9443/tcp
 ufw allow 443/tcp
