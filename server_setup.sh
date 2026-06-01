@@ -121,6 +121,20 @@ else
     success "Docker установлен: $(docker --version)"
 fi
 
+# Проверяем docker compose plugin отдельно
+info "Проверка docker compose plugin..."
+if docker compose version &>/dev/null; then
+    success "docker compose: $(docker compose version)"
+else
+    warn "docker compose plugin не найден — устанавливаем..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-plugin
+    if docker compose version &>/dev/null; then
+        success "docker compose установлен: $(docker compose version)"
+    else
+        die "Не удалось установить docker compose plugin!"
+    fi
+fi
+
 # Добавляем пользователя в группу docker
 if id "${NEW_USER}" &>/dev/null; then
     usermod -aG docker "${NEW_USER}"
