@@ -121,6 +121,25 @@ else
     success "Docker установлен: $(docker --version)"
 fi
 
+# Проверяем что Docker демон реально запущен
+info "Проверка Docker демона..."
+if ! systemctl is-active --quiet docker; then
+    warn "Docker демон не запущен — запускаем..."
+    systemctl enable docker
+    systemctl start docker
+    sleep 3
+fi
+
+# Финальная проверка доступности сокета
+if ! docker info &>/dev/null; then
+    warn "Docker сокет недоступен — пробуем перезапустить..."
+    systemctl restart docker
+    sleep 5
+    docker info &>/dev/null || die "Docker демон не запустился! Проверь: systemctl status docker"
+fi
+
+success "Docker демон запущен и работает."
+
 # Проверяем docker compose plugin отдельно
 info "Проверка docker compose plugin..."
 if docker compose version &>/dev/null; then
