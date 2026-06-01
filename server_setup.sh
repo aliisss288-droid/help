@@ -171,6 +171,7 @@ apt-get install -y -qq ufw
 ufw --force enable
 ufw allow OpenSSH          # временно, пока не переключимся на новый порт
 
+ufw allow 80/tcp
 ufw allow 2222/tcp
 ufw allow "${SSH_PORT}/tcp"
 ufw allow 9443/tcp
