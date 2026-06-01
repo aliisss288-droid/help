@@ -37,9 +37,103 @@ if [[ -z "$SSH_PUBKEY" ]]; then
 fi
 
 # ============================================================
-#  3. UFW — базовые правила
+#  3. СНЯТИЕ БЛОКИРОВКИ DPKG (на случай unattended-upgrades)
+# ============================================================
+info "Проверка блокировок dpkg..."
+
+# Убиваем unattended-upgrades если запущен
+if pgrep -x unattended-upgr &>/dev/null; then
+    warn "Обнаружен процесс unattended-upgrades — останавливаем..."
+    systemctl stop unattended-upgrades 2>/dev/null || true
+    killall unattended-upgrades 2>/dev/null || true
+    sleep 3
+fi
+
+# Снимаем блокировки
+rm -f /var/lib/dpkg/lock-frontend
+rm -f /var/lib/dpkg/lock
+rm -f /var/cache/apt/archives/lock
+
+# Восстанавливаем dpkg если нужно
+dpkg --configure -a 2>/dev/null || true
+
+# Отключаем автообновление чтобы не мешало в будущем
+systemctl disable unattended-upgrades 2>/dev/null || true
+systemctl mask unattended-upgrades 2>/dev/null || true
+
+success "Блокировки сняты."
+
+# ============================================================
+#  4. ОБНОВЛЕНИЕ UBUNTU
+# ============================================================
+info "Обновление системы Ubuntu..."
+
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
+DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -qq
+apt-get clean
+
+success "Система обновлена."
+
+# ============================================================
+#  5. УСТАНОВКА DOCKER
+# ============================================================
+info "Установка Docker..."
+
+if command -v docker &>/dev/null; then
+    warn "Docker уже установлен: $(docker --version) — пропускаем."
+else
+    # Удаляем старые версии если есть
+    apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+
+    # Зависимости
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        ca-certificates \
+        curl \
+        gnupg \
+        lsb-release
+
+    # Официальный GPG-ключ Docker
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+
+    # Репозиторий Docker
+    echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+        https://download.docker.com/linux/ubuntu \
+        $(lsb_release -cs) stable" \
+        | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        docker-ce \
+        docker-ce-cli \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-compose-plugin
+
+    # Запуск и автозапуск
+    systemctl enable docker
+    systemctl start docker
+
+    success "Docker установлен: $(docker --version)"
+fi
+
+# Добавляем пользователя в группу docker
+if id "${NEW_USER}" &>/dev/null; then
+    usermod -aG docker "${NEW_USER}"
+    success "'${NEW_USER}' добавлен в группу docker."
+fi
+
+# ============================================================
+#  6. UFW — базовые правила
 # ============================================================
 info "Настройка UFW..."
+
+# Устанавливаем ufw если нет
+apt-get install -y -qq ufw
 
 ufw --force enable
 ufw allow OpenSSH          # временно, пока не переключимся на новый порт
@@ -52,7 +146,7 @@ ufw allow 443/tcp
 success "Базовые правила UFW добавлены."
 
 # ============================================================
-#  4. /etc/ufw/before.rules — блокировка лишних ICMP
+#  7. /etc/ufw/before.rules — блокировка лишних ICMP
 # ============================================================
 info "Патчим /etc/ufw/before.rules (DROP для ICMP)..."
 
@@ -85,7 +179,7 @@ ufw disable && ufw --force enable
 success "ICMP-правила применены."
 
 # ============================================================
-#  5. Создание пользователя
+#  8. Создание пользователя
 # ============================================================
 info "Создание пользователя '${NEW_USER}'..."
 
@@ -100,7 +194,7 @@ usermod -aG sudo "${NEW_USER}"
 success "'${NEW_USER}' добавлен в группу sudo."
 
 # ============================================================
-#  6. SSH-ключ для нового пользователя
+#  9. SSH-ключ для нового пользователя
 # ============================================================
 info "Настройка SSH-ключа..."
 
@@ -124,7 +218,7 @@ ls -ld "${SSH_DIR}"
 ls -l  "${AUTH_KEYS}"
 
 # ============================================================
-#  7. sshd_config
+#  10. sshd_config
 # ============================================================
 info "Настройка /etc/ssh/sshd_config..."
 
@@ -158,7 +252,7 @@ systemctl restart ssh
 success "SSH-сервис перезапущен."
 
 # ============================================================
-#  8. Удаление старых UFW-правил для стандартного SSH
+#  11. Удаление старых UFW-правил для стандартного SSH
 # ============================================================
 info "Удаление правил для стандартного SSH (22/OpenSSH)..."
 
@@ -166,10 +260,14 @@ ufw delete allow OpenSSH   2>/dev/null && success "Правило OpenSSH уда
 ufw delete allow 22/tcp    2>/dev/null && success "Правило 22/tcp удалено."   || warn "Правило 22/tcp не найдено — ок."
 
 # ============================================================
-#  9. Итоговая проверка
+#  12. Итоговая проверка
 # ============================================================
 echo
 echo -e "${BOLD}══════════════ ИТОГ ══════════════${RESET}"
+
+echo -e "\n${CYAN}Версии:${RESET}"
+docker --version
+docker compose version
 
 echo -e "\n${CYAN}UFW статус:${RESET}"
 ufw status
