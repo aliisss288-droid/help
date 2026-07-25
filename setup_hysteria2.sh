@@ -3,9 +3,8 @@
 # setup-hysteria2.sh
 # Подготовка сервера под Hysteria2 для Remnawave Node.
 # Выпускает TLS-сертификат через certbot (отдельный docker-compose в /opt/certbot),
-# пробрасывает /opt/certbot/certs в контейнер remnanode как /etc/letsencrypt:ro
-# и ставит cron на автообновление (28-е число месяца).
-# Firewall НЕ трогает — порты считаются уже открытыми.
+# пробрасывает /opt/certbot/certs в контейнер remnanode как /etc/letsencrypt:ro,
+# открывает UDP-порт Hysteria2 в ufw и ставит cron на автообновление (28-е число).
 # Профиль Hysteria2 в панели настраивается вручную.
 #
 # Запуск:  sudo bash setup-hysteria2.sh
@@ -16,6 +15,7 @@ set -euo pipefail
 CERT_EMAIL="admin@nimeline.org"
 CERTBOT_DIR="/opt/certbot"
 NODE_DIR="/opt/remnanode"
+HY2_PORT_DEFAULT="8443"
 
 # ── Цвета ────────────────────────────────────────────────────
 c_ok()   { printf "\033[32m✅ %s\033[0m\n" "$*"; }
@@ -38,9 +38,17 @@ fi
 
 # ── Ввод домена ──────────────────────────────────────────────
 c_head "🌐 Домен для Hysteria2"
-read -rp "Введи домен для сертификата (например secure-web.de01.nimeline.org): " HY2_DOMAIN
+read -rp "Введи домен для сертификата (например secure-h2.de01.nimeline.org): " HY2_DOMAIN
 if [[ -z "${HY2_DOMAIN}" ]]; then
   c_err "Домен не введён. Выход."
+  exit 1
+fi
+
+# ── Ввод порта Hysteria2 ─────────────────────────────────────
+read -rp "UDP-порт для Hysteria2 [${HY2_PORT_DEFAULT}]: " HY2_PORT
+HY2_PORT="${HY2_PORT:-${HY2_PORT_DEFAULT}}"
+if ! [[ "${HY2_PORT}" =~ ^[0-9]+$ ]] || (( HY2_PORT < 1 || HY2_PORT > 65535 )); then
+  c_err "Некорректный порт: ${HY2_PORT}. Выход."
   exit 1
 fi
 
@@ -150,6 +158,25 @@ else
   c_warn "Файл ${COMPOSE_FILE} не найден — добавь volume и перезапусти ноду вручную."
 fi
 
+# ── Шаг 4: открытие порта Hysteria2 в firewall ───────────────
+c_head "🔌 Открытие порта ${HY2_PORT}/udp в firewall"
+if command -v ufw >/dev/null 2>&1; then
+  UFW_STATUS="$(ufw status 2>/dev/null | head -n1 || echo "")"
+  if echo "${UFW_STATUS}" | grep -qi "inactive"; then
+    c_warn "ufw неактивен — правило не требуется (firewall не блокирует порты)."
+    c_inf "Если фильтрация есть на стороне хостера — открой ${HY2_PORT}/udp в его панели."
+  else
+    if ufw status | grep -qE "^${HY2_PORT}/udp\s"; then
+      c_ok "Порт ${HY2_PORT}/udp уже открыт в ufw"
+    else
+      ufw allow "${HY2_PORT}/udp" >/dev/null
+      c_ok "Порт ${HY2_PORT}/udp открыт в ufw"
+    fi
+  fi
+else
+  c_warn "ufw не установлен — открой ${HY2_PORT}/udp в своём firewall/панели хостера вручную."
+fi
+
 # ── Шаг 5: автообновление через cron ─────────────────────────
 c_head "🔄 Автообновление сертификата (cron, 28-е число)"
 CRON_LINE="0 0 28 * * cd ${CERTBOT_DIR} && docker compose run --rm certbot renew"
@@ -162,6 +189,8 @@ fi
 
 # ── Готово ───────────────────────────────────────────────────
 c_head "📋 Готово"
-c_ok "Сертификат выпущен, проброшен в ноду, автообновление настроено."
+c_ok "Сертификат выпущен, проброшен в ноду, порт ${HY2_PORT}/udp открыт, автообновление настроено."
 c_inf "Осталось вручную: добавить профиль Hysteria2 в панель и создать Host."
 c_inf "В путях сертификата профиля используй домен: ${HY2_DOMAIN}"
+c_inf "В профиле и в хосте укажи порт: ${HY2_PORT}"
+c_inf "Проверить, что нода слушает порт: sudo ss -ulnp | grep ':${HY2_PORT}'"
