@@ -660,27 +660,62 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 EOF
 
+# Страховка: на время проверки sshd слушает И новый порт, И 22.
+# Порт 22 закрывается только после того, как ты подтвердишь вход по новому порту.
+TEMP22="/etc/ssh/sshd_config.d/99-temp-port22.conf"
+[[ "$SSH_PORT" != 22 ]] && echo "Port 22" > "$TEMP22"
+
 mkdir -p /run/sshd
-sshd -t || die "Ошибка в конфиге sshd — изменения не применены. Проверь: sshd -t"
-EFFECTIVE_PORTS="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | tr '\n' ' ')"
-[[ "$EFFECTIVE_PORTS" == "${SSH_PORT} " ]] || warn "sshd будет слушать порты: ${EFFECTIVE_PORTS:-?} (ожидался ${SSH_PORT})"
+if ! sshd -t; then
+    rm -f "$TEMP22"
+    die "Ошибка в конфиге sshd — sshd НЕ перезапускался. Бэкап: ${SSHD_CONFIG}.bak.*"
+fi
 info "sshd_config: $(grep -E '^Port[[:space:]]' "$SSHD_CONFIG")"
 
-systemctl daemon-reload
-# Ubuntu 22.10+ использует socket activation — порт берётся из ssh.socket
-if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
-    systemctl restart ssh.socket
-fi
-systemctl restart ssh 2>/dev/null || systemctl restart sshd
-sleep 2
-
-if ss -tln | grep -q ":${SSH_PORT}\b"; then
-    success "SSH слушает порт $SSH_PORT."
-    ufw delete allow OpenSSH >/dev/null 2>&1 || true
-    ufw delete allow 22/tcp  >/dev/null 2>&1 || true
-    success "Правила для порта 22 удалены из UFW."
+# Сервис в Ubuntu/Debian называется ssh, в RHEL-подобных — sshd
+if systemctl list-unit-files ssh.service 2>/dev/null | grep -q '^ssh\.service'; then
+    SSH_UNIT=ssh
 else
-    warn "SSH НЕ слушает $SSH_PORT! Порт 22 оставлен открытым. Проверь: ss -tlnp | grep ssh"
+    SSH_UNIT=sshd
+fi
+
+# Перезапуск sshd НЕ рвёт текущие сессии (KillMode=process) — рвётся только прослушивающий процесс.
+restart_sshd() {
+    systemctl daemon-reload
+    # Ubuntu 22.10+: socket activation — порты берутся из ssh.socket (генерируется из sshd_config)
+    if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+        systemctl restart ssh.socket
+    fi
+    systemctl restart "$SSH_UNIT"
+    sleep 2
+}
+restart_sshd
+
+if ! ss -tln | grep -q ":${SSH_PORT}\b"; then
+    warn "SSH НЕ слушает $SSH_PORT! Оставляю порт 22. Проверь: ss -tlnp | grep ssh"
+else
+    success "SSH слушает порты: $(ss -tlnH | awk '{print $4}' | grep -oE '[0-9]+$' | grep -xE "22|${SSH_PORT}" | sort -u | tr '\n' ' ')"
+    CONFIRMED=n
+    if [[ "$SSH_PORT" == 22 ]]; then
+        CONFIRMED=y
+    elif { : </dev/tty; } 2>/dev/null; then
+        echo
+        echo -e "${BOLD}${YELLOW}Проверь вход по новому порту в НОВОМ окне терминала (это не закрывай!):${RESET}"
+        echo -e "    ${BOLD}ssh -p ${SSH_PORT} ${NEW_USER}@${SERVER_IP:-<IP>}${RESET}"
+        CONFIRMED=""; ask_yn CONFIRMED "Вход по порту ${SSH_PORT} работает? Закрыть порт 22?" n
+    fi
+
+    if [[ $CONFIRMED == y ]]; then
+        rm -f "$TEMP22"
+        restart_sshd
+        ufw delete allow OpenSSH >/dev/null 2>&1 || true
+        ufw delete allow 22/tcp  >/dev/null 2>&1 || true
+        success "Порт 22 закрыт. SSH только на ${SSH_PORT}."
+    else
+        warn "Порт 22 оставлен открытым (страховка). Когда проверишь вход по ${SSH_PORT}, закрой его:"
+        echo "    sudo rm -f $TEMP22 && sudo systemctl daemon-reload && sudo systemctl restart ssh.socket; sudo systemctl restart $SSH_UNIT"
+        echo "    sudo ufw delete allow OpenSSH; sudo ufw delete allow 22/tcp"
+    fi
 fi
 
 # ============================================================
