@@ -171,9 +171,9 @@ head_ "Протоколы"
 
 USE_TCP=n; USE_XHTTP=n; USE_GRPC=n; USE_HY2=n
 if [[ -z "${PROTOCOLS:-}" ]]; then
-    echo "  1) VLESS TCP Reality"
-    echo "  2) VLESS XHTTP Reality"
-    echo "  3) VLESS gRPC Reality"
+    echo "  1) VLESS TCP Reality   — proxy (443)"
+    echo "  2) VLESS XHTTP Reality — bg (444)"
+    echo "  3) VLESS gRPC Reality  — bg-2 (6437)"
     echo "  4) Hysteria2"
     echo "  5) Все протоколы"
     tty_read PROTOCOLS "Какие включить? Номера через пробел или запятую [1]: "
@@ -194,9 +194,9 @@ done
 USE_REALITY=n
 [[ $USE_TCP == y || $USE_XHTTP == y || $USE_GRPC == y ]] && USE_REALITY=y
 
-[[ $USE_TCP   == y ]] && ask_tcp_port TCP_PORT   "Порт VLESS TCP Reality"   "443"  "VLESS TCP"
-[[ $USE_XHTTP == y ]] && ask_tcp_port XHTTP_PORT "Порт VLESS XHTTP Reality" "8443" "VLESS XHTTP"
-[[ $USE_GRPC  == y ]] && ask_tcp_port GRPC_PORT  "Порт VLESS gRPC Reality"  "2053" "VLESS gRPC"
+[[ $USE_TCP   == y ]] && ask_tcp_port TCP_PORT   "Порт VLESS TCP Reality (proxy)"  "443"  "proxy (TCP)"
+[[ $USE_XHTTP == y ]] && ask_tcp_port XHTTP_PORT "Порт VLESS XHTTP Reality (bg)" "444"  "bg (XHTTP)"
+[[ $USE_GRPC  == y ]] && ask_tcp_port GRPC_PORT  "Порт VLESS gRPC Reality (bg-2)" "6437" "bg-2 (gRPC)"
 
 if [[ $USE_HY2 == y ]]; then
     while true; do
@@ -559,11 +559,11 @@ JSON
 }
 
 INBOUNDS=()
-[[ $USE_TCP == y ]] && INBOUNDS+=("$(vless_inbound VLESS-TCP-REALITY "$TCP_PORT" \
+[[ $USE_TCP == y ]] && INBOUNDS+=("$(vless_inbound proxy "$TCP_PORT" \
     "$(reality_stream tcp '')")")
-[[ $USE_XHTTP == y ]] && INBOUNDS+=("$(vless_inbound VLESS-XHTTP-REALITY "$XHTTP_PORT" \
+[[ $USE_XHTTP == y ]] && INBOUNDS+=("$(vless_inbound bg "$XHTTP_PORT" \
     "$(reality_stream xhttp "\"xhttpSettings\": { \"path\": \"${XHTTP_PATH}\", \"mode\": \"auto\" },")")")
-[[ $USE_GRPC == y ]] && INBOUNDS+=("$(vless_inbound VLESS-GRPC-REALITY "$GRPC_PORT" \
+[[ $USE_GRPC == y ]] && INBOUNDS+=("$(vless_inbound bg-2 "$GRPC_PORT" \
     "$(reality_stream grpc "\"grpcSettings\": { \"serviceName\": \"${GRPC_SERVICE}\" },")")")
 [[ $USE_HY2 == y ]] && INBOUNDS+=("$(cat <<JSON
 {
