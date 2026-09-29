@@ -638,14 +638,22 @@ head_ "SSH"
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
 cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%s)"
-# Комментируем активные Port в основном конфиге (иначе sshd слушает оба порта)
+# Порт прописываем прямо в /etc/ssh/sshd_config: "#Port 22" → "Port ${SSH_PORT}".
+# Сначала комментируем все активные Port (иначе sshd слушает несколько портов),
+# затем первую строку "#Port ..." заменяем на нужный порт.
 sed -i -E 's/^[[:space:]]*Port[[:space:]]+/#&/' "$SSHD_CONFIG"
+if grep -qE '^#[[:space:]]*Port[[:space:]]+' "$SSHD_CONFIG"; then
+    sed -i -E "0,/^#[[:space:]]*Port[[:space:]]+.*/s//Port ${SSH_PORT}/" "$SSHD_CONFIG"
+else
+    echo "Port ${SSH_PORT}" >> "$SSHD_CONFIG"
+fi
+mkdir -p /etc/ssh/sshd_config.d
+# Port в drop-in файлах (cloud-init и т.п.) тоже глушим
+sed -i -E 's/^[[:space:]]*Port[[:space:]]+/#&/' /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
 grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$SSHD_CONFIG" || \
     sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$SSHD_CONFIG"
-mkdir -p /etc/ssh/sshd_config.d
-# 00- грузится первым и имеет приоритет над 50-cloud-init.conf и т.п.
+# Остальные параметры — в 00- (грузится первым и имеет приоритет над 50-cloud-init.conf)
 cat > /etc/ssh/sshd_config.d/00-node-setup.conf <<EOF
-Port ${SSH_PORT}
 PermitRootLogin prohibit-password
 PubkeyAuthentication yes
 PasswordAuthentication no
@@ -654,6 +662,9 @@ EOF
 
 mkdir -p /run/sshd
 sshd -t || die "Ошибка в конфиге sshd — изменения не применены. Проверь: sshd -t"
+EFFECTIVE_PORTS="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | tr '\n' ' ')"
+[[ "$EFFECTIVE_PORTS" == "${SSH_PORT} " ]] || warn "sshd будет слушать порты: ${EFFECTIVE_PORTS:-?} (ожидался ${SSH_PORT})"
+info "sshd_config: $(grep -E '^Port[[:space:]]' "$SSHD_CONFIG")"
 
 systemctl daemon-reload
 # Ubuntu 22.10+ использует socket activation — порт берётся из ssh.socket
