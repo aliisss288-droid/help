@@ -200,12 +200,12 @@ USE_REALITY=n
 
 if [[ $USE_HY2 == y ]]; then
     while true; do
-        ask HY2_PORT "UDP-порт Hysteria2" "443"
+        ask HY2_PORT "UDP-порт Hysteria2" "8443"
         valid_port "$HY2_PORT" && break
         warn "Некорректный порт."; HY2_PORT=""
     done
-    ask HY2_DOMAIN "Домен для сертификата Hysteria2 (например secure-h2.de01.nimeline.org)"
-    ask CERT_EMAIL "E-mail для Let's Encrypt" "aliisss288@gmail.com"
+    ask HY2_DOMAIN "Домен для сертификата Hysteria2 (например secure-h2.de01.domain.com)"
+    ask CERT_EMAIL "E-mail для Let's Encrypt" "Mail.com"
 fi
 
 head_ "Selfsteal"
@@ -218,7 +218,7 @@ else
 fi
 
 if [[ $SELFSTEAL == y ]]; then
-    ask SELFSTEAL_DOMAIN "Домен Selfsteal (= serverNames в Reality, например secure-web.de01.nimeline.org)"
+    ask SELFSTEAL_DOMAIN "Домен Selfsteal (= serverNames в Reality, например secure-web.de01.domain.com)"
     ask_tcp_port SELFSTEAL_PORT "HTTPS-порт Selfsteal (= target Reality)" "9443" "Selfsteal"
     REALITY_SNI="$SELFSTEAL_DOMAIN"
     REALITY_TARGET="127.0.0.1:${SELFSTEAL_PORT}"
@@ -263,6 +263,14 @@ if [[ "${ASSUME_YES:-}" != 1 ]]; then
     [[ $GO == y ]] || die "Отменено пользователем."
 fi
 
+# С этого момента обрыв SSH не убивает установку:
+# SIGHUP игнорируется, весь вывод дублируется в лог (tee не падает, если терминал пропал).
+INSTALL_LOG="/var/log/node-setup.log"
+echo "===== $(date '+%F %T') node_setup.sh =====" >> "$INSTALL_LOG"
+trap '' HUP
+exec > >(tee -a --output-error=warn "$INSTALL_LOG") 2>&1
+info "Если SSH отвалится — установка продолжится. Следить: tail -f $INSTALL_LOG"
+
 # ============================================================
 #  2. БЛОКИРОВКИ DPKG И ОБНОВЛЕНИЕ СИСТЕМЫ
 # ============================================================
@@ -280,10 +288,17 @@ systemctl disable unattended-upgrades 2>/dev/null || true
 systemctl mask unattended-upgrades 2>/dev/null || true
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get upgrade -y -qq
-apt-get install -y -qq curl ca-certificates openssl jq ufw cron dnsutils
-apt-get autoremove -y -qq
+APT_OPTS=(-y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+# Длинный вывод apt/dpkg пишем в лог, на экран — только статус
+run_logged() { # run_logged <описание> <команда...>
+    info "$1... (лог: $INSTALL_LOG)"
+    shift
+    "$@" >>"$INSTALL_LOG" 2>&1 || die "Ошибка на шаге выше. Смотри: tail -50 $INSTALL_LOG"
+}
+run_logged "apt update"            apt-get update -qq
+run_logged "Обновление пакетов"    apt-get upgrade "${APT_OPTS[@]}"
+run_logged "Установка утилит"      apt-get install "${APT_OPTS[@]}" curl ca-certificates openssl jq ufw cron dnsutils
+run_logged "Очистка"               apt-get autoremove "${APT_OPTS[@]}"
 apt-get clean
 success "Система обновлена."
 
@@ -295,7 +310,7 @@ head_ "Docker"
 if command -v docker &>/dev/null; then
     success "Docker уже установлен: $(docker --version)"
 else
-    curl -fsSL https://get.docker.com | sh
+    run_logged "Установка Docker" sh -c "curl -fsSL https://get.docker.com | sh"
     success "Docker установлен: $(docker --version)"
 fi
 systemctl enable --now docker >/dev/null 2>&1 || true
@@ -303,7 +318,7 @@ if ! docker info &>/dev/null; then
     systemctl restart docker; sleep 5
     docker info &>/dev/null || die "Docker не запустился: systemctl status docker"
 fi
-docker compose version &>/dev/null || apt-get install -y -qq docker-compose-plugin
+docker compose version &>/dev/null || run_logged "Установка docker compose" apt-get install "${APT_OPTS[@]}" docker-compose-plugin
 docker compose version &>/dev/null || die "Не удалось установить docker compose plugin."
 success "$(docker compose version)"
 
@@ -500,6 +515,9 @@ if [[ $SELFSTEAL == y ]]; then
     head_ "Selfsteal"
     if command -v selfsteal &>/dev/null || [[ -d "$CADDY_DIR" ]]; then
         warn "Selfsteal уже установлен — пропускаю. Управление: selfsteal status"
+    elif ! { : </dev/tty; } 2>/dev/null; then
+        warn "Терминал недоступен (SSH отвалился?) — мастер Selfsteal пропущен."
+        warn "Запусти вручную: sudo bash -c 'bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install'"
     else
         echo -e "${YELLOW}Сейчас запустится мастер Selfsteal. Отвечай так:${RESET}"
         echo -e "  Домен       → ${BOLD}${SELFSTEAL_DOMAIN}${RESET}"
