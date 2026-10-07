@@ -293,6 +293,13 @@ wait_until() {
     return 1
 }
 
+# ВАЖНО: при set -o pipefail конструкция «cmd | grep -q» может ложно вернуть ошибку
+# (grep закрывает канал раньше, cmd получает SIGPIPE). Поэтому вывод сначала сохраняем.
+tcp_listen()  { [[ -n "$(ss -Hltn "( sport = :$1 )" 2>/dev/null)" ]]; }
+unit_loaded() { [[ "$(systemctl show -p LoadState --value "$1" 2>/dev/null)" == loaded ]]; }
+cron_has()    { grep -qF "$1" <<<"$(crontab -l 2>/dev/null || true)"; }
+ufw_active()  { grep -q 'Status: active' <<<"$(ufw status 2>/dev/null || true)"; }
+
 # retry <попыток> <команда...> — для сетевых операций
 retry() {
     local n=$1 i; shift
@@ -596,7 +603,8 @@ head_ "Docker"
 
 # Если сеть хостера в диапазоне 172.16–31.x, стандартная сеть Docker (172.17.0.0/16)
 # конфликтует с ней и сервер теряет связь. Тогда задаём Docker другой диапазон.
-if [[ ! -f /etc/docker/daemon.json ]] && ip -4 route | grep -qE '(^|[[:space:]])172\.(1[6-9]|2[0-9]|3[01])\.' \
+HOST_ROUTES="$(ip -4 route 2>/dev/null || true)"
+if [[ ! -f /etc/docker/daemon.json ]] && grep -qE '(^|[[:space:]])172\.(1[6-9]|2[0-9]|3[01])\.' <<<"$HOST_ROUTES" \
    && ! ip -4 addr show docker0 &>/dev/null; then
     mkdir -p /etc/docker
     cat > /etc/docker/daemon.json <<'EOF'
@@ -800,7 +808,7 @@ EOF
 
     CRON_LINE="0 0 28 * * $CERTBOT_DIR/renew.sh >> /var/log/certbot-renew.log 2>&1"
     { crontab -l 2>/dev/null | grep -vF "certbot renew" | grep -vF "$CERTBOT_DIR/renew.sh" || true; echo "$CRON_LINE"; } | crontab -
-    crontab -l 2>/dev/null | grep -qF "$CERTBOT_DIR/renew.sh" \
+    cron_has "$CERTBOT_DIR/renew.sh" \
         || die "Не удалось добавить задание в cron." "Добавь вручную: (crontab -l; echo '$CRON_LINE') | crontab -"
     success "Cron: продление 28-го числа каждого месяца ($CERTBOT_DIR/renew.sh)"
 fi
@@ -853,7 +861,7 @@ run_logged "Запуск remnanode" "Смотри: docker compose -f $NODE_DIR/d
 
 node_ready() {
     [[ "$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' remnanode 2>/dev/null)" == "true false" ]] \
-        && ss -Hltn "( sport = :$NODE_PORT )" | grep -q .
+        && tcp_listen "$NODE_PORT"
 }
 info "Жду, пока нода поднимет порт $NODE_PORT (до 60 с)..."
 if wait_until 60 node_ready; then
@@ -1183,23 +1191,35 @@ if ! sshd -t 2>>"$INSTALL_LOG"; then
         "Пришли вывод: sshd -t"
 fi
 
-# Сервис в Ubuntu/Debian называется ssh, в RHEL-подобных — sshd
-if systemctl list-unit-files ssh.service 2>/dev/null | grep -q '^ssh\.service'; then SSH_UNIT=ssh; else SSH_UNIT=sshd; fi
+# Служба SSH: в Ubuntu/Debian — ssh, в RHEL-подобных — sshd
+if unit_loaded ssh.service; then SSH_UNIT=ssh
+elif unit_loaded sshd.service; then SSH_UNIT=sshd
+else SSH_UNIT=""
+fi
+SSH_SOCKET=n
+if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then SSH_SOCKET=y; fi
+if [[ -z "$SSH_UNIT" && $SSH_SOCKET == n ]]; then
+    die "Не найдена служба SSH (ни ssh.service, ни sshd.service)." "Пришли вывод: systemctl list-unit-files | grep -i ssh"
+fi
 
 # Перезапуск sshd НЕ рвёт открытые сессии (KillMode=process) — меняется только приём новых подключений.
 restart_sshd() {
     systemctl daemon-reload
     # Ubuntu 22.10+: socket activation — порты берутся из ssh.socket (генерируется из sshd_config)
-    if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then systemctl restart ssh.socket; fi
-    systemctl restart "$SSH_UNIT"
+    if [[ $SSH_SOCKET == y ]]; then
+        systemctl restart ssh.socket || warn "Не удалось перезапустить ssh.socket"
+    fi
+    if [[ -n "$SSH_UNIT" ]]; then
+        systemctl restart "$SSH_UNIT" || warn "Не удалось перезапустить $SSH_UNIT (проверю, слушает ли порт)"
+    fi
     sleep 2
 }
 restart_sshd
 
 SSH_CLOSED_OLD=n
-if ! wait_until 15 bash -c "ss -Hltn '( sport = :${SSH_PORT} )' | grep -q ."; then
+if ! wait_until 15 tcp_listen "$SSH_PORT"; then
     warn "SSH НЕ слушает порт $SSH_PORT! Старый порт (${OLD_PORTS:-22}) оставлен — доступ не потерян."
-    warn "Проверь: ss -tlnp | grep ssh ; journalctl -u $SSH_UNIT --no-pager | tail -20"
+    warn "Проверь: ss -tlnp | grep ssh ; journalctl -u ${SSH_UNIT:-ssh} --no-pager | tail -20"
 elif [[ -z "$OLD_PORTS" ]]; then
     SSH_CLOSED_OLD=y
     success "SSH слушает порт $SSH_PORT."
@@ -1223,7 +1243,10 @@ else
         success "Старый порт закрыт. SSH только на ${SSH_PORT}."
     else
         warn "Старый порт ${OLD_PORTS% } оставлен открытым. Когда проверишь вход по ${SSH_PORT}, закрой его:"
-        echo "    sudo rm -f $TEMP_OLD && sudo systemctl daemon-reload && sudo systemctl restart ssh.socket $SSH_UNIT"
+        RESTART_HINT="sudo systemctl daemon-reload"
+        if [[ $SSH_SOCKET == y ]]; then RESTART_HINT+=" && sudo systemctl restart ssh.socket"; fi
+        if [[ -n "$SSH_UNIT" ]]; then RESTART_HINT+=" && sudo systemctl restart $SSH_UNIT"; fi
+        echo "    sudo rm -f $TEMP_OLD && $RESTART_HINT"
         for p in $OLD_PORTS; do echo "    sudo ufw delete allow ${p}/tcp"; done
     fi
 fi
@@ -1244,7 +1267,6 @@ check() { # check <что проверяем> <как исправить> <ко�
         CHECK_FAILS=$((CHECK_FAILS + 1))
     fi
 }
-tcp_listen() { ss -Hltn "( sport = :$1 )" | grep -q .; }
 
 check "Docker работает" "systemctl restart docker" docker info
 check "remnanode запущен" "docker compose -f $NODE_DIR/docker-compose.yml logs --tail 30" node_ready
@@ -1253,7 +1275,7 @@ if [[ $USE_HY2 == y ]]; then
     check "Сертификат Hysteria2 есть" "запусти скрипт ещё раз" test -f "$CERTBOT_DIR/certs/live/$HY2_DOMAIN/fullchain.pem"
     check "Сертификат виден внутри ноды" "docker compose -f $NODE_DIR/docker-compose.yml up -d --force-recreate" \
         docker exec remnanode test -f "/etc/letsencrypt/live/$HY2_DOMAIN/fullchain.pem"
-    check "Cron автопродления установлен" "запусти скрипт ещё раз" bash -c "crontab -l | grep -qF '$CERTBOT_DIR/renew.sh'"
+    check "Cron автопродления установлен" "запусти скрипт ещё раз" cron_has "$CERTBOT_DIR/renew.sh"
 fi
 if [[ $SELFSTEAL == y ]]; then
     check "Caddy (Selfsteal) запущен" "docker logs --tail 30 selfsteal-caddy" \
@@ -1263,9 +1285,9 @@ if [[ $SELFSTEAL == y ]]; then
 fi
 check "Профиль для панели создан" "запусти скрипт ещё раз" jq -e '.inbounds | length > 0' "$NODE_DIR/profile.json"
 if [[ $UFW_OK == y ]]; then
-    check "UFW включён" "ufw --force enable" bash -c "ufw status | grep -q 'Status: active'"
+    check "UFW включён" "ufw --force enable" ufw_active
 fi
-check "SSH слушает порт $SSH_PORT" "ss -tlnp | grep ssh ; journalctl -u $SSH_UNIT | tail" tcp_listen "$SSH_PORT"
+check "SSH слушает порт $SSH_PORT" "ss -tlnp | grep ssh ; journalctl -u ${SSH_UNIT:-ssh} | tail" tcp_listen "$SSH_PORT"
 
 # ============================================================
 #  13. ИТОГ
