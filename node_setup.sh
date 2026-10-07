@@ -180,23 +180,107 @@ check_dns() { # check_dns <domain>
         "В DNS-панели домена создай A-запись $domain → $SERVER_IP (без прокси Cloudflare), подожди 5–10 минут."
 }
 
-# Какие процессы слушают порт: port_owners tcp|udp <port>
-port_owners() {
-    local flag=t; [[ $1 == udp ]] && flag=u
-    { ss -Hlnp$flag "( sport = :$2 )" 2>/dev/null | grep -o 'users:(("[^"]*"' | sed 's/users:(("//; s/"$//' | sort -u | tr '\n' ' '; } || true
+# ── IP / домен панели ────────────────────────────────────────
+ip2int() { # ip2int <ip> <переменная> — IPv4 в число (без подоболочек)
+    local a b c d
+    IFS=. read -r a b c d <<<"$1"
+    printf -v "$2" '%d' $(( (10#$a << 24) + (10#$b << 16) + (10#$c << 8) + 10#$d ))
+}
+in_cidr() { # in_cidr <ip> <сеть/длина>
+    local net=${2%/*} len=${2#*/} mask ipn netn
+    mask=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+    ip2int "$1" ipn
+    ip2int "$net" netn
+    (( (ipn & mask) == (netn & mask) ))
+}
+# Диапазоны прокси Cloudflare: за ними не настоящий IP сервера панели
+CF_NETS="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18
+190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14
+172.64.0.0/13 131.0.72.0/22"
+is_cloudflare_ip() {
+    local n
+    for n in $CF_NETS; do if in_cidr "$1" "$n"; then return 0; fi; done
+    return 1
 }
 
-# Порт должен быть свободен или занят «нашими» процессами (повторный запуск)
-check_port_free() { # check_port_free tcp|udp <port> <назначение>
-    local owners o
-    owners="$(port_owners "$1" "$2")"
-    for o in $owners; do
-        case "$o" in
-            rw-core|xray|caddy|node|docker-proxy|sshd|systemd|certbot) ;;
-            *) die "Порт $2/$1 ($3) уже занят программой «$o»." \
-                   "Останови её: systemctl disable --now $o  (или apt purge $o), либо выбери другой порт." ;;
-        esac
+# PANEL_IP: пусто / IP / домен (можно с https:// и портом) → IP; домен сохраняется в PANEL_HOST
+normalize_panel() {
+    local v="${PANEL_IP,,}" r
+    v="${v//[[:space:]]/}"; v="${v#http://}"; v="${v#https://}"; v="${v%%/*}"; v="${v%%:*}"
+    PANEL_IP="$v"; PANEL_HOST=""
+    if [[ -z "$v" ]] || valid_ip "$v"; then return 0; fi
+    if ! valid_domain "$v"; then warn "Это не IP и не домен: $v"; return 1; fi
+    r="$(getent ahostsv4 "$v" 2>/dev/null | awk '{print $1}' | head -n1 || true)"
+    if [[ -z "$r" ]]; then warn "Домен $v не резолвится — проверь написание или укажи IP."; return 1; fi
+    if is_cloudflare_ip "$r"; then
+        warn "Домен $v идёт через прокси Cloudflare ($r) — это не настоящий IP панели, нода будет недоступна."
+        warn "Укажи IP сервера панели или домен без прокси (серое облако в Cloudflare)."
+        PANEL_IP=""; return 1
+    fi
+    PANEL_HOST="$v"; PANEL_IP="$r"
+    success "Панель: $v → $r"
+}
+
+# Какие процессы слушают порт: port_owners tcp|udp <port> → "имя:pid имя:pid ..."
+port_owners() {
+    local flag=t; [[ $1 == udp ]] && flag=u
+    { ss -Hlnp$flag "( sport = :$2 )" 2>/dev/null | grep -o '"[^"]*",pid=[0-9]*' \
+        | sed 's/^"\([^"]*\)",pid=\([0-9]*\)$/\1:\2/' | sort -u | tr '\n' ' '; } || true
+}
+
+# Процесс работает внутри наших контейнеров (remnanode / selfsteal-caddy / certbot)?
+is_our_container_process() { # is_our_container_process <pid>
+    local pid=$1 id ids
+    [[ -r "/proc/$pid/cgroup" ]] || return 1
+    command -v docker >/dev/null || return 1
+    ids="$(docker ps -q --no-trunc --filter name=remnanode --filter name=selfsteal-caddy --filter name=certbot 2>/dev/null || true)"
+    for id in $ids; do
+        if grep -q "$id" "/proc/$pid/cgroup"; then return 0; fi
     done
+    return 1
+}
+
+# Чужие процессы на порту (не наши контейнеры и не sshd): foreign_port_owners tcp|udp <port>
+foreign_port_owners() {
+    local entry name pid out=""
+    for entry in $(port_owners "$1" "$2"); do
+        name=${entry%%:*}; pid=${entry##*:}
+        if is_our_container_process "$pid"; then continue; fi
+        case "$name" in
+            rw-node|rw-core|xray|caddy|node|docker-proxy|sshd|systemd|certbot) continue ;;
+        esac
+        out+="$entry "
+    done
+    echo "$out"
+}
+
+# Остановить чужую службу, занявшую порт (на сервере должна работать только эта установка)
+free_port_owner() { # free_port_owner <имя> <pid> <порт/назначение>
+    local unit
+    unit="$(ps -o unit= -p "$2" 2>/dev/null | tr -d '[:space:]' || true)"
+    case "$unit" in
+        ""|-|ssh.service|sshd.service|ssh.socket|systemd-*|init.scope|session-*.scope|user@*.service)
+            die "Порт $3 занят программой «$1» (pid $2), и её нельзя остановить автоматически." \
+                "Останови её вручную: kill $2  и запусти скрипт снова." ;;
+    esac
+    warn "Порт $3 занят службой $unit («$1») — останавливаю её и отключаю автозапуск."
+    systemctl disable --now "$unit" >/dev/null 2>&1 || systemctl stop "$unit" >/dev/null 2>&1 || true
+}
+
+# Порт должен быть свободен или занят «нашими» процессами; чужие службы останавливаются сами
+check_port_free() { # check_port_free tcp|udp <port> <назначение>
+    local foreign entry
+    foreign="$(foreign_port_owners "$1" "$2")"
+    if [[ -z "$foreign" ]]; then return 0; fi
+    for entry in $foreign; do
+        free_port_owner "${entry%%:*}" "${entry##*:}" "$2/$1 ($3)"
+    done
+    sleep 2
+    foreign="$(foreign_port_owners "$1" "$2")"
+    if [[ -n "$foreign" ]]; then
+        die "Порт $2/$1 ($3) всё ещё занят: $foreign" "Останови вручную: kill <pid> (pid указан выше) и запусти скрипт снова."
+    fi
+    success "Порт $2/$1 освобождён."
 }
 
 # wait_until <секунд> <команда...> — ждать, пока команда не станет успешной
@@ -278,14 +362,16 @@ done
 
 ask_tcp_port NODE_PORT "Node Port (порт API ноды, как в панели)" "2222" "Node API"
 
+# Панель: можно IP или домен. UFW понимает только IP, поэтому домен переводим в IP.
+PANEL_HOST=""
 if [[ -z "${PANEL_IP+x}" ]]; then
     while true; do
-        tty_read PANEL_IP "IP панели — открыть Node Port только для него (Enter — для всех): "
-        if [[ -z "$PANEL_IP" ]] || valid_ip "$PANEL_IP"; then break; fi
-        warn "Некорректный IP: $PANEL_IP"
+        tty_read PANEL_IP "IP или домен панели — открыть Node Port только для неё (Enter — для всех): "
+        if normalize_panel; then break; fi
     done
-elif [[ -n "$PANEL_IP" ]] && ! valid_ip "$PANEL_IP"; then
-    die "PANEL_IP=$PANEL_IP — некорректный IP." "Укажи IP вида 1.2.3.4 или оставь пустым."
+else
+    normalize_panel || die "PANEL_IP=$PANEL_IP — не удалось определить IP панели." \
+        "Укажи IP вида 1.2.3.4, домен панели без прокси Cloudflare или оставь пустым."
 fi
 
 head_ "Протоколы"
@@ -383,7 +469,7 @@ cat <<EOF
   SSH-порт          : $SSH_PORT (сейчас: ${CURRENT_SSH_PORTS% })
   SSH-ключ          : ${SSH_PUBKEY:0:40}...
   SECRET_KEY        : ${SECRET_KEY:0:12}... (${#SECRET_KEY} симв.)
-  Node Port         : $NODE_PORT ${PANEL_IP:+(только с $PANEL_IP)}
+  Node Port         : $NODE_PORT ${PANEL_IP:+(только с $PANEL_IP${PANEL_HOST:+ = $PANEL_HOST})}
   VLESS TCP         : $(yn $USE_TCP)${TCP_PORT:+, порт $TCP_PORT/tcp}
   VLESS XHTTP       : $(yn $USE_XHTTP)${XHTTP_PORT:+, порт $XHTTP_PORT/tcp}
   VLESS gRPC        : $(yn $USE_GRPC)${GRPC_PORT:+, порт $GRPC_PORT/tcp}
@@ -412,6 +498,33 @@ FREE_MB="$(df -Pm / | awk 'NR==2{print $4}')"
 if (( FREE_MB < 2000 )); then
     die "На диске свободно всего ${FREE_MB} МБ." "Нужно минимум 2 ГБ: очисти диск (apt clean, docker system prune -a) или возьми тариф побольше."
 fi
+
+# На сервере должна работать только эта установка: останавливаем ВСЕ контейнеры.
+# Наши (remnanode, selfsteal-caddy) скрипт поднимет заново ниже; чужим отключаем автозапуск,
+# чтобы после перезагрузки они не заняли порты. Данные контейнеров не удаляются.
+if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+    RUNNING_ALL="$(docker ps -q)"
+    if [[ -n "$RUNNING_ALL" ]]; then
+        info "Останавливаю все Docker-контейнеры ($(echo "$RUNNING_ALL" | wc -w) шт.)..."
+        # shellcheck disable=SC2086
+        docker stop $RUNNING_ALL >/dev/null || warn "Часть контейнеров не остановилась — проверь: docker ps"
+    fi
+    FOREIGN_CONTAINERS=""
+    while read -r cid cname; do
+        [[ -n "$cid" ]] || continue
+        case "$cname" in
+            remnanode|selfsteal-caddy|certbot) ;;
+            *) docker update --restart=no "$cid" >/dev/null 2>&1 || true
+               FOREIGN_CONTAINERS+="$cname " ;;
+        esac
+    done < <(docker ps -a --format '{{.ID}} {{.Names}}')
+    if [[ -n "$FOREIGN_CONTAINERS" ]]; then
+        warn "Сторонние контейнеры остановлены, автозапуск отключён: $FOREIGN_CONTAINERS"
+        warn "(не удалены; удалить вручную при желании: docker rm <имя>)"
+    fi
+    success "Docker-контейнеры остановлены."
+fi
+
 for p in "${!USED_TCP[@]}"; do
     if [[ "$p" != "$SSH_PORT" ]]; then check_port_free tcp "$p" "${USED_TCP[$p]}"; fi
 done
@@ -1162,7 +1275,10 @@ echo "===== Remnawave node setup — $(date '+%F %T') ====="
 echo "IP сервера      : ${SERVER_IP:-?}"
 echo "SSH             : ssh -p ${SSH_PORT} ${NEW_USER}@${SERVER_IP:-<IP>}"
 if [[ $SSH_CLOSED_OLD == n && -n "$OLD_PORTS" ]]; then echo "                  (старый порт ${OLD_PORTS% } пока тоже открыт)"; fi
-echo "Node Port       : ${NODE_PORT}"
+echo "Node Port       : ${NODE_PORT}${PANEL_IP:+ (открыт только для ${PANEL_IP}${PANEL_HOST:+ = ${PANEL_HOST}})}"
+if [[ -n "$PANEL_HOST" ]]; then
+    echo "                  если IP панели сменится: sudo ufw allow from <новый IP> to any port ${NODE_PORT} proto tcp"
+fi
 if [[ $USE_TCP   == y ]]; then echo "proxy (TCP)     : ${TCP_PORT}/tcp"; fi
 if [[ $USE_XHTTP == y ]]; then echo "bg (XHTTP)      : ${XHTTP_PORT}/tcp, path ${XHTTP_PATH}"; fi
 if [[ $USE_GRPC  == y ]]; then echo "bg-2 (gRPC)     : ${GRPC_PORT}/tcp, serviceName ${GRPC_SERVICE}"; fi
