@@ -8,7 +8,9 @@
 #   3. BBR, UFW (только нужные порты), блокировка ICMP
 #   4. Hysteria2: сертификат Let's Encrypt (certbot) + автопродление (cron, 28-е число)
 #   5. remnanode: /opt/remnanode/docker-compose.yml заполняется и запускается сам
-#   6. Selfsteal: Caddy с сайтом-заглушкой и своим сертификатом (/opt/caddy)
+#   6. Selfsteal: Caddy со своим сертификатом (/opt/caddy) и сайтом-заглушкой —
+#      случайный шаблон из DigneZzZ/remnawave-scripts (MIT), уникальный для каждой установки
+#      (выбрать вручную: SELFSTEAL_TEMPLATE=filecloud|speedtest|YouTube|10gag|...)
 #   7. Config Profile для панели: /opt/remnanode/profile.json
 #   8. SSH на новый порт (старый закрывается только после проверки входа)
 #   9. итоговая проверка всего, при ошибке — подсказка, как исправить
@@ -572,6 +574,38 @@ show_output() {
     echo "----------------------------------------------"
 }
 
+# ensure_image <образ:тег> — скачать образ; если Docker Hub недоступен или упёрся в лимит,
+# взять его через зеркала (по мотивам selfsteal.sh DigneZzZ). mirror.gcr.io — кэш Google,
+# не расходует лимит Docker Hub. Образ перетегируется в обычное имя, compose его использует.
+DOCKER_MIRRORS=(mirror.gcr.io dockerhub.timeweb.cloud huecker.io)
+ensure_image() {
+    local ref=$1 repo tag path m src out
+    info "Загрузка образа $ref..."
+    out="$(mktemp)"
+    if retry 2 docker pull -q "$ref" >"$out" 2>&1; then
+        cat "$out" >> "$INSTALL_LOG"; rm -f "$out"; return 0
+    fi
+    cat "$out" >> "$INSTALL_LOG"
+    warn "Docker Hub не отдал $ref — пробую зеркала..."
+    repo="${ref%:*}"; tag="${ref##*:}"
+    if [[ "$repo" == */* ]]; then path="$repo"; else path="library/$repo"; fi
+    for m in "${DOCKER_MIRRORS[@]}"; do
+        src="$m/$path:$tag"
+        if docker pull -q "$src" >>"$INSTALL_LOG" 2>&1 && docker tag "$src" "$ref" >>"$INSTALL_LOG" 2>&1; then
+            docker rmi "$src" >/dev/null 2>&1 || true
+            success "Образ $ref получен через зеркало $m"
+            rm -f "$out"; return 0
+        fi
+    done
+    if docker image inspect "$ref" >/dev/null 2>&1; then
+        warn "Не удалось обновить $ref — использую уже скачанную версию."
+        rm -f "$out"; return 0
+    fi
+    show_output "$out" 5; rm -f "$out"
+    fail "Не удалось скачать образ $ref ни с Docker Hub, ни с зеркал." \
+        "Проверь интернет на сервере (curl -I https://registry-1.docker.io). При лимите Docker Hub подожди ~6 часов или выполни: docker login"
+}
+
 # Ждём, пока закончится автообновление (иначе apt занят)
 if pgrep -x 'apt|apt-get|dpkg|unattended-upgr' >/dev/null; then
     info "Сейчас работает автообновление Ubuntu — жду его завершения (до 10 минут)..."
@@ -743,8 +777,7 @@ YAML
     if [[ -f "$CERT_FILE" ]]; then
         success "Сертификат уже есть — пропускаю выпуск."
     else
-        run_logged "Загрузка certbot" "Проверь доступ к Docker Hub: docker pull certbot/certbot" \
-            docker pull -q certbot/certbot
+        ensure_image certbot/certbot:latest
 
         # certbot --standalone нужен свободный порт 80 — временно останавливаем контейнеры
         RUNNING_CONTAINERS="$(docker ps -q)"
@@ -854,8 +887,7 @@ docker compose -f "$NODE_DIR/docker-compose.yml" config -q >>"$INSTALL_LOG" 2>&1
     || die "docker-compose.yml ноды получился некорректным." "Пришли вывод: docker compose -f $NODE_DIR/docker-compose.yml config"
 success "Создан $NODE_DIR/docker-compose.yml"
 
-run_logged "Загрузка образа remnawave/node" "Проверь доступ к Docker Hub: docker pull remnawave/node:latest" \
-    docker compose -f "$NODE_DIR/docker-compose.yml" pull -q
+ensure_image remnawave/node:latest
 run_logged "Запуск remnanode" "Смотри: docker compose -f $NODE_DIR/docker-compose.yml logs" \
     docker compose -f "$NODE_DIR/docker-compose.yml" up -d --force-recreate
 
@@ -875,6 +907,11 @@ fi
 # ============================================================
 #  9. SELFSTEAL — Caddy с сайтом-заглушкой (без ручных шагов)
 # ============================================================
+# Шаблоны сайтов: github.com/DigneZzZ/remnawave-scripts/sni-templates (MIT, автор DigneZzZ).
+# Шаблон выбирается случайно (или SELFSTEAL_TEMPLATE=<имя>) и уникализируется под каждую установку.
+CADDY_VERSION="2.11.7"
+SELFSTEAL_TEMPLATES=(10gag convertit converter downloader filecloud games-site modmanager speedtest YouTube 503-1 503-2)
+TEMPLATES_URL="https://codeload.github.com/DigneZzZ/remnawave-scripts/tar.gz/refs/heads/main"
 
 caddy_cert_ready() {
     compgen -G "$CADDY_DIR/data/caddy/certificates/*/$SELFSTEAL_DOMAIN/$SELFSTEAL_DOMAIN.crt" >/dev/null
@@ -884,76 +921,66 @@ caddy_https_ok() {
         --resolve "$SELFSTEAL_DOMAIN:$SELFSTEAL_PORT:127.0.0.1" "https://$SELFSTEAL_DOMAIN:$SELFSTEAL_PORT/")" == 200 ]]
 }
 
-if [[ $SELFSTEAL == y ]]; then
-    head_ "Selfsteal: $SELFSTEAL_DOMAIN → 127.0.0.1:$SELFSTEAL_PORT"
+# Уникализация шаблона (по мотивам randomize_template из selfsteal.sh DigneZzZ):
+# своё название/цвет/описание, убраны следы источника и внешние запросы, байтовый «шум».
+randomize_site() { # randomize_site <папка сайта>
+    local dir=$1 f
+    local adjs=(Swift Bright Lumen Nimbus Vivid Prime Atlas Pulse Nova Quartz Onyx Vertex Cobalt Ember Drift Solace Zephyr Apex Halcyon Meridian Aero Cedar Indigo Mistral)
+    local nouns=(Cloud Vault Hub Forge Works Studio Labs Stream Desk Space Grid Port Wave Loop Stack Nest Spark Core Pixel Harbor Bay Field Crest Point)
+    local descs=("Fast, simple and secure." "Your files, anywhere you go." "Built for speed and privacy." "Reliable service, every day." "Modern tools that just work." "Simple. Fast. Yours.")
+    local brand="${adjs[RANDOM % ${#adjs[@]}]} ${nouns[RANDOM % ${#nouns[@]}]}"
+    local short="${brand%% *}"
+    local desc="${descs[RANDOM % ${#descs[@]}]}"
+    local deg=$(( (RANDOM % 300) + 30 )) sat=$(( (RANDOM % 30) + 90 )) hue=$(( RANDOM % 360 ))
+    local ver; ver="$(openssl rand -hex 3)"
 
-    # Чужая установка в /opt/caddy (например, selfsteal.sh от DigneZzZ) — останавливаем и сохраняем
-    if [[ -f "$CADDY_DIR/docker-compose.yml" && ! -f "$CADDY_DIR/.node_setup" ]]; then
-        warn "В $CADDY_DIR найдена другая установка Caddy — останавливаю и переношу в ${CADDY_DIR}.bak"
-        docker compose -f "$CADDY_DIR/docker-compose.yml" down >/dev/null 2>&1 || true
-        rm -rf "${CADDY_DIR}.bak"; mv "$CADDY_DIR" "${CADDY_DIR}.bak"
-    fi
-    mkdir -p "$CADDY_DIR/html" "$CADDY_DIR/data" "$CADDY_DIR/config"
-    touch "$CADDY_DIR/.node_setup"
+    # 1. следы источника: README, лицензии, source maps
+    find "$dir" -type f \( -iname '*.md' -o -iname 'LICENSE*' -o -iname '*.map' -o -iname '.git*' \) -delete 2>/dev/null || true
 
-    # Caddyfile: сайт слушает только 127.0.0.1:${SELFSTEAL_PORT} (туда ходит Reality),
-    # порт 80 — наружу, для выпуска сертификата и редиректа.
-    # E-mail — только внутри issuer acme (рядом с ним Caddy не допускает «tls <email>»).
-    CADDY_ACME_EMAIL=""
-    if [[ -n "$CERT_EMAIL" ]]; then CADDY_ACME_EMAIL=$'\t\t\temail '"$CERT_EMAIL"$'\n'; fi
-    cat > "$CADDY_DIR/Caddyfile" <<EOF
-{
-	https_port ${SELFSTEAL_PORT}
-	default_bind 127.0.0.1
-	auto_https disable_redirects
-	servers {
-		protocols h1 h2
-	}
+    # 2. HTML: заголовок, бренд, описание, без Google Fonts и внешних запросов, свой цвет
+    while IFS= read -r -d '' f; do
+        sed -i "s#<title>[^<]*</title>#<title>${brand}</title>#" "$f" 2>/dev/null || true
+        sed -i "s#MyWebSite#${brand}#g; s#MySite#${short}#g" "$f" 2>/dev/null || true
+        sed -i "s#\(name=[\"']description[\"'][^>]*content=\)[\"'][^\"']*[\"']#\1\"${desc}\"#Ig" "$f" 2>/dev/null || true
+        sed -i "/fonts\.googleapis\.com/d; /fonts\.gstatic\.com/d" "$f" 2>/dev/null || true
+        sed -i "s#https\?://api\.ipify\.org[^\"')]*#/_s/ip#g" "$f" 2>/dev/null || true
+        sed -i "s#/vite\.svg#/favicon.svg#g" "$f" 2>/dev/null || true
+        sed -i -E "s#((href|src)=\"[^\"]*\.(css|js))(\?[^\"]*)?\"#\1?v=${ver}\"#g" "$f" 2>/dev/null || true
+        sed -i "s#</head>#<style>html{filter:hue-rotate(${deg}deg) saturate(${sat}%)}img,picture,video,svg,canvas{filter:hue-rotate(-${deg}deg)}</style><!-- $(openssl rand -hex 6) --></head>#I" "$f" 2>/dev/null || true
+    done < <(find "$dir" -type f -iname '*.html' -print0 2>/dev/null)
+
+    # 3. CSS/JS: убрать внешний запрос IP + байтовый «шум»
+    while IFS= read -r -d '' f; do
+        sed -i "s#https\?://api\.ipify\.org[^\"')]*#/_s/ip#g" "$f" 2>/dev/null || true
+        printf '\n/* %s */\n' "$(openssl rand -hex 6)" >> "$f" 2>/dev/null || true
+    done < <(find "$dir" -type f \( -iname '*.css' -o -iname '*.js' \) -print0 2>/dev/null)
+
+    # 4. своя иконка и название в manifest
+    cat > "$dir/favicon.svg" <<SVG
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="hsl(${hue},68%,50%)"/><circle cx="32" cy="32" r="13" fill="hsl($(( (hue + 45) % 360 )),72%,90%)"/></svg>
+SVG
+    while IFS= read -r -d '' f; do
+        sed -i "s#MyWebSite#${brand}#g; s#MySite#${short}#g" "$f" 2>/dev/null || true
+    done < <(find "$dir" -type f \( -iname '*.webmanifest' -o -iname 'manifest.json' \) -print0 2>/dev/null)
+
+    SITE_BRAND="$brand"
 }
 
-http://${SELFSTEAL_DOMAIN} {
-	bind 0.0.0.0
-	redir https://${SELFSTEAL_DOMAIN}{uri} permanent
-}
-
-https://${SELFSTEAL_DOMAIN} {
-	tls {
-		issuer acme {
-${CADDY_ACME_EMAIL}			disable_tlsalpn_challenge
-		}
-	}
-	root * /var/www/html
-	try_files {path} /index.html
-	file_server
-}
-
-:${SELFSTEAL_PORT} {
-	tls internal
-	respond 204
-}
-
-:80 {
-	bind 0.0.0.0
-	respond 204
-}
-EOF
-
-    # Сайт-заглушка (уникальное название и цвет для каждой установки)
-    if [[ ! -f "$CADDY_DIR/html/index.html" ]]; then
-        BRANDS=("Northwind Labs" "Lumora Studio" "Brightpath Cloud" "Vectorly" "Cloudnest" "Harborline Systems" "Quantix Data" "Stellar Forge" "Bluepeak Digital" "Mosaic Works")
-        BRAND="${BRANDS[RANDOM % ${#BRANDS[@]}]}"
-        HUE=$((RANDOM % 360))
-        YEAR="$(date +%Y)"
-        cat > "$CADDY_DIR/html/index.html" <<EOF
+# Запасная страница — если шаблоны не скачались (нет доступа к GitHub)
+write_builtin_page() { # write_builtin_page <файл>
+    local brands=("Northwind Labs" "Lumora Studio" "Brightpath Cloud" "Vectorly" "Cloudnest" "Harborline Systems" "Quantix Data" "Stellar Forge")
+    local brand="${brands[RANDOM % ${#brands[@]}]}" hue=$((RANDOM % 360)) year
+    year="$(date +%Y)"
+    cat > "$1" <<EOF
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${BRAND} — Cloud infrastructure for growing teams</title>
-<meta name="description" content="${BRAND} builds reliable cloud infrastructure, storage and analytics for modern businesses.">
+<title>${brand} — Cloud infrastructure for growing teams</title>
+<meta name="description" content="${brand} builds reliable cloud infrastructure, storage and analytics for modern businesses.">
 <style>
-  :root { --accent: hsl(${HUE} 65% 45%); --bg: #f7f8fa; --text: #1d2330; --muted: #5b6475; }
+  :root { --accent: hsl(${hue} 65% 45%); --bg: #f7f8fa; --text: #1d2330; --muted: #5b6475; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
   header { display: flex; justify-content: space-between; align-items: center; padding: 20px 6vw; background: #fff; border-bottom: 1px solid #e6e8ee; }
@@ -972,7 +999,7 @@ EOF
 </head>
 <body>
 <header>
-  <div class="logo">${BRAND}</div>
+  <div class="logo">${brand}</div>
   <nav><a href="#">Products</a><a href="#">Pricing</a><a href="#">Docs</a><a href="#">Contact</a></nav>
 </header>
 <section class="hero">
@@ -985,16 +1012,116 @@ EOF
   <div class="card"><h3>Secure by default</h3><p>Encryption at rest and in transit, role-based access and audit logs out of the box.</p></div>
   <div class="card"><h3>24/7 support</h3><p>Our engineers are available around the clock to help your team succeed.</p></div>
 </section>
-<footer>&copy; ${YEAR} ${BRAND}. All rights reserved.</footer>
+<footer>&copy; ${year} ${brand}. All rights reserved.</footer>
 </body>
 </html>
 EOF
+    SITE_BRAND="$brand"
+}
+
+# Скачать шаблон из репозитория DigneZzZ и уникализировать; при неудаче — запасная страница
+install_site_template() { # install_site_template <шаблон>
+    local tpl=$1 html="$CADDY_DIR/html" tmpd
+    tmpd="$(mktemp -d)"
+    info "Загружаю шаблон сайта «$tpl» (DigneZzZ/remnawave-scripts, MIT)..."
+    mkdir -p "$tmpd/site"
+    if retry 2 curl -fsSL --max-time 120 "$TEMPLATES_URL" -o "$tmpd/repo.tgz" >>"$INSTALL_LOG" 2>&1 \
+       && tar -xzf "$tmpd/repo.tgz" -C "$tmpd/site" --wildcards --strip-components=3 "*/sni-templates/$tpl/*" >>"$INSTALL_LOG" 2>&1 \
+       && [[ -f "$tmpd/site/index.html" ]]; then
+        randomize_site "$tmpd/site"
+        rm -rf "$html"; mv "$tmpd/site" "$html"
+        echo "$tpl" > "$CADDY_DIR/.template"
+        success "Шаблон «$tpl» установлен, уникализирован: «$SITE_BRAND»."
+    else
+        warn "Не удалось скачать шаблон с GitHub — ставлю встроенную страницу."
+        rm -rf "$html"; mkdir -p "$html"
+        write_builtin_page "$html/index.html"
+        echo "builtin" > "$CADDY_DIR/.template"
+    fi
+    chmod -R a+rX "$html"
+    rm -rf "$tmpd"
+}
+
+if [[ $SELFSTEAL == y ]]; then
+    head_ "Selfsteal: $SELFSTEAL_DOMAIN → 127.0.0.1:$SELFSTEAL_PORT"
+
+    # Чужая установка в /opt/caddy (например, selfsteal.sh от DigneZzZ) — останавливаем и сохраняем
+    if [[ -f "$CADDY_DIR/docker-compose.yml" && ! -f "$CADDY_DIR/.node_setup" ]]; then
+        warn "В $CADDY_DIR найдена другая установка Caddy — останавливаю и переношу в ${CADDY_DIR}.bak"
+        docker compose -f "$CADDY_DIR/docker-compose.yml" down >/dev/null 2>&1 || true
+        rm -rf "${CADDY_DIR}.bak"; mv "$CADDY_DIR" "${CADDY_DIR}.bak"
+    fi
+    mkdir -p "$CADDY_DIR/html" "$CADDY_DIR/data" "$CADDY_DIR/config"
+    touch "$CADDY_DIR/.node_setup"
+
+    # Сайт: при первой установке (или если указан SELFSTEAL_TEMPLATE) — шаблон; при повторном запуске сайт не меняется
+    CURRENT_TEMPLATE="$(cat "$CADDY_DIR/.template" 2>/dev/null || true)"
+    if [[ -n "${SELFSTEAL_TEMPLATE:-}" && " ${SELFSTEAL_TEMPLATES[*]} " != *" $SELFSTEAL_TEMPLATE "* ]]; then
+        die "Неизвестный шаблон SELFSTEAL_TEMPLATE=$SELFSTEAL_TEMPLATE" "Доступны: ${SELFSTEAL_TEMPLATES[*]}"
+    fi
+    if [[ -n "${SELFSTEAL_TEMPLATE:-}" && "$SELFSTEAL_TEMPLATE" != "$CURRENT_TEMPLATE" ]]; then
+        install_site_template "$SELFSTEAL_TEMPLATE"
+    elif [[ -z "$CURRENT_TEMPLATE" || "$CURRENT_TEMPLATE" == builtin || ! -f "$CADDY_DIR/html/index.html" ]]; then
+        install_site_template "${SELFSTEAL_TEMPLATES[RANDOM % ${#SELFSTEAL_TEMPLATES[@]}]}"
+    else
+        success "Сайт уже установлен (шаблон «$CURRENT_TEMPLATE») — оставляю как есть."
     fi
 
-    cat > "$CADDY_DIR/docker-compose.yml" <<'YAML'
+    # Caddyfile: сайт слушает только 127.0.0.1:${SELFSTEAL_PORT} (туда ходит Reality),
+    # порт 80 — наружу, для выпуска сертификата и редиректа.
+    # E-mail — только внутри issuer acme (рядом с ним Caddy не допускает «tls <email>»).
+    # admin off — без него Caddy в network_mode: host может уйти в цикл перезапусков.
+    CADDY_ACME_EMAIL=""
+    if [[ -n "$CERT_EMAIL" ]]; then CADDY_ACME_EMAIL=$'\t\t\temail '"$CERT_EMAIL"$'\n'; fi
+    cat > "$CADDY_DIR/Caddyfile" <<EOF
+{
+	https_port ${SELFSTEAL_PORT}
+	default_bind 127.0.0.1
+	auto_https disable_redirects
+	admin off
+	servers {
+		protocols h1 h2
+	}
+}
+
+http://${SELFSTEAL_DOMAIN} {
+	bind 0.0.0.0
+	redir https://${SELFSTEAL_DOMAIN}{uri} permanent
+}
+
+https://${SELFSTEAL_DOMAIN} {
+	tls {
+		issuer acme {
+${CADDY_ACME_EMAIL}			disable_tlsalpn_challenge
+		}
+	}
+	encode gzip
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		X-XSS-Protection "1; mode=block"
+	}
+	root * /var/www/html
+	try_files {path} /index.html
+	file_server
+}
+
+:${SELFSTEAL_PORT} {
+	tls internal
+	respond 204
+}
+
+:80 {
+	bind 0.0.0.0
+	respond 204
+}
+EOF
+
+    cat > "$CADDY_DIR/docker-compose.yml" <<YAML
 services:
   caddy:
-    image: caddy:2
+    image: caddy:${CADDY_VERSION}
     container_name: selfsteal-caddy
     network_mode: host
     restart: always
@@ -1005,10 +1132,9 @@ services:
       - ./config:/config
 YAML
 
-    run_logged "Загрузка образа Caddy" "Проверь доступ к Docker Hub: docker pull caddy:2" \
-        docker compose -f "$CADDY_DIR/docker-compose.yml" pull -q
+    ensure_image "caddy:${CADDY_VERSION}"
     CADDY_OUT="$(mktemp)"
-    if ! docker run --rm -v "$CADDY_DIR/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2 \
+    if ! docker run --rm -v "$CADDY_DIR/Caddyfile:/etc/caddy/Caddyfile:ro" "caddy:${CADDY_VERSION}" \
             caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >"$CADDY_OUT" 2>&1; then
         cat "$CADDY_OUT" >> "$INSTALL_LOG"
         show_output "$CADDY_OUT" 10
@@ -1016,12 +1142,12 @@ YAML
     fi
     cat "$CADDY_OUT" >> "$INSTALL_LOG"; rm -f "$CADDY_OUT"
     run_logged "Запуск Caddy" "Смотри: docker logs selfsteal-caddy" \
-        docker compose -f "$CADDY_DIR/docker-compose.yml" up -d --force-recreate
+        docker compose -f "$CADDY_DIR/docker-compose.yml" up -d --force-recreate --remove-orphans
 
     info "Жду сертификат Let's Encrypt для $SELFSTEAL_DOMAIN (до 3 минут)..."
     if wait_until 180 caddy_cert_ready && wait_until 30 caddy_https_ok; then
-
-        success "Selfsteal работает: https://$SELFSTEAL_DOMAIN (внутри: 127.0.0.1:$SELFSTEAL_PORT)"
+        success "Selfsteal работает внутри сервера (127.0.0.1:$SELFSTEAL_PORT), сертификат получен."
+        info "В браузере https://$SELFSTEAL_DOMAIN откроется после применения профиля в панели (порт 443 — это Xray Reality)."
     else
         echo "------ логи Caddy ------"; docker logs --tail 15 selfsteal-caddy 2>&1 || true; echo "------------------------"
         warn "Сертификат для $SELFSTEAL_DOMAIN пока не получен. Caddy продолжит пытаться сам."
@@ -1330,6 +1456,10 @@ echo -e "${BOLD}В панели осталось:${RESET}"
 echo "  1. Config Profiles → создать профиль и вставить JSON выше (или: cat ${NODE_DIR}/profile.json)."
 echo "  2. Nodes → у этой ноды выбрать профиль и отметить inbound'ы."
 echo "  3. Hosts → создать хост для каждого inbound'а."
+if [[ $SELFSTEAL == y ]]; then
+    echo "  После шага 2 нода запустит Xray на порту 443, и тогда https://${SELFSTEAL_DOMAIN} откроется в браузере."
+    echo "  Проверка: curl -sI https://${SELFSTEAL_DOMAIN} | head -1   → HTTP/2 200"
+fi
 echo
 if (( CHECK_FAILS > 0 )); then
     warn "Проверок не пройдено: $CHECK_FAILS — исправь по подсказкам «→» выше и запусти скрипт ещё раз."
