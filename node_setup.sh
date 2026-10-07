@@ -417,6 +417,7 @@ for p in "${!USED_TCP[@]}"; do
 done
 if [[ $NEED_80 == y ]]; then check_port_free tcp 80 "выпуск сертификатов"; fi
 if [[ $USE_HY2 == y ]]; then check_port_free udp "$HY2_PORT" "Hysteria2"; fi
+# shellcheck disable=SC2076  # намеренно буквальное совпадение порта в списке
 if [[ ! " $CURRENT_SSH_PORTS " =~ " $SSH_PORT " ]]; then check_port_free tcp "$SSH_PORT" "новый SSH"; fi
 success "Диск: ${FREE_MB} МБ свободно, нужные порты свободны."
 
@@ -431,14 +432,24 @@ APT_OPTS=(-y -qq -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -
 
 # Длинный вывод apt/docker пишем только в лог, на экран — статус
 run_logged() { # run_logged <описание> <решение при ошибке> <команда...>
-    local desc=$1 sol=$2; shift 2
+    local desc=$1 sol=$2 out rc=0; shift 2
     info "$desc..."
-    if ! retry 3 "$@" >>"$INSTALL_LOG" 2>&1; then
-        echo "------ последние строки лога ------"
-        tail -n 15 "$INSTALL_LOG" || true
-        echo "-----------------------------------"
+    out="$(mktemp)"
+    retry 3 "$@" >"$out" 2>&1 || rc=$?
+    cat "$out" >> "$INSTALL_LOG"
+    if (( rc != 0 )); then
+        show_output "$out" 15
+        rm -f "$out"
         fail "$desc — не удалось." "$sol"
     fi
+    rm -f "$out"
+}
+
+# show_output <файл> <строк> — показать хвост вывода упавшей команды
+show_output() {
+    echo "------ вывод команды (последние строки) ------"
+    tail -n "$2" "$1" || true
+    echo "----------------------------------------------"
 }
 
 # Ждём, пока закончится автообновление (иначе apt занят)
@@ -631,17 +642,19 @@ YAML
 
         info "Запрашиваю сертификат у Let's Encrypt..."
         CERTBOT_RC=0
+        CERTBOT_OUT="$(mktemp)"
         docker run --rm \
             -v "$CERTBOT_DIR/certs:/etc/letsencrypt" \
             -v "$CERTBOT_DIR/var-lib-letsencrypt:/var/lib/letsencrypt" \
             --network host \
             certbot/certbot certonly --standalone \
             --non-interactive --agree-tos "${CERTBOT_EMAIL_ARGS[@]}" \
-            -d "$HY2_DOMAIN" >>"$INSTALL_LOG" 2>&1 || CERTBOT_RC=$?
+            -d "$HY2_DOMAIN" >"$CERTBOT_OUT" 2>&1 || CERTBOT_RC=$?
+        cat "$CERTBOT_OUT" >> "$INSTALL_LOG"
 
         restore_containers; trap - EXIT
         if [[ $CERTBOT_RC -ne 0 || ! -f "$CERT_FILE" ]]; then
-            echo "------ ответ certbot ------"; tail -n 12 "$INSTALL_LOG" || true; echo "---------------------------"
+            show_output "$CERTBOT_OUT" 12
             die "Let's Encrypt не выдал сертификат для $HY2_DOMAIN." \
                 "1) A-запись $HY2_DOMAIN должна указывать на ${SERVER_IP:-IP сервера} (без прокси Cloudflare). 2) Порт 80 должен быть открыт у хостера. 3) Если в ответе «too many certificates» — лимит Let's Encrypt, подожди 1 час."
         fi
@@ -764,6 +777,9 @@ if [[ $SELFSTEAL == y ]]; then
 
     # Caddyfile: сайт слушает только 127.0.0.1:${SELFSTEAL_PORT} (туда ходит Reality),
     # порт 80 — наружу, для выпуска сертификата и редиректа.
+    # E-mail — только внутри issuer acme (рядом с ним Caddy не допускает «tls <email>»).
+    CADDY_ACME_EMAIL=""
+    if [[ -n "$CERT_EMAIL" ]]; then CADDY_ACME_EMAIL=$'\t\t\temail '"$CERT_EMAIL"$'\n'; fi
     cat > "$CADDY_DIR/Caddyfile" <<EOF
 {
 	https_port ${SELFSTEAL_PORT}
@@ -780,9 +796,9 @@ http://${SELFSTEAL_DOMAIN} {
 }
 
 https://${SELFSTEAL_DOMAIN} {
-	tls ${CERT_EMAIL:-internal@${SELFSTEAL_DOMAIN}} {
+	tls {
 		issuer acme {
-			disable_tlsalpn_challenge
+${CADDY_ACME_EMAIL}			disable_tlsalpn_challenge
 		}
 	}
 	root * /var/www/html
@@ -870,11 +886,14 @@ YAML
 
     run_logged "Загрузка образа Caddy" "Проверь доступ к Docker Hub: docker pull caddy:2" \
         docker compose -f "$CADDY_DIR/docker-compose.yml" pull -q
+    CADDY_OUT="$(mktemp)"
     if ! docker run --rm -v "$CADDY_DIR/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2 \
-            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >>"$INSTALL_LOG" 2>&1; then
-        tail -n 10 "$INSTALL_LOG" || true
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >"$CADDY_OUT" 2>&1; then
+        cat "$CADDY_OUT" >> "$INSTALL_LOG"
+        show_output "$CADDY_OUT" 10
         die "Caddyfile не прошёл проверку." "Пришли вывод выше — это ошибка скрипта."
     fi
+    cat "$CADDY_OUT" >> "$INSTALL_LOG"; rm -f "$CADDY_OUT"
     run_logged "Запуск Caddy" "Смотри: docker logs selfsteal-caddy" \
         docker compose -f "$CADDY_DIR/docker-compose.yml" up -d --force-recreate
 
