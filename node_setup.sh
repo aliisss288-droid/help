@@ -496,8 +496,8 @@ else
         ask_tcp_port SOCKS_PORT "Порт SOCKS5" "$SOCKS_DEFAULT_PORT" "SOCKS5"
         while true; do
             ask SOCKS_USER "Логин SOCKS5" "panel"
-            if [[ "$SOCKS_USER" =~ ^[A-Za-z0-9_]{3,32}$ ]]; then break; fi
-            warn "Логин: латиница, цифры, _ (3–32 символа)."; SOCKS_USER=""
+            if [[ "$SOCKS_USER" =~ ^[A-Za-z0-9_-]{3,32}$ ]]; then break; fi
+            warn "Логин: латиница, цифры, _ и - (3–32 символа)."; SOCKS_USER=""
         done
         # Пароль генерируется сам — только латиница и цифры, чтобы URL не ломался
         SOCKS_PASS="${SOCKS_PASS:-$(openssl rand -hex 16)}"
@@ -656,21 +656,29 @@ ensure_image() {
         "Проверь интернет на сервере (curl -I https://registry-1.docker.io). При лимите Docker Hub подожди ~6 часов или выполни: docker login"
 }
 
-# Ждём, пока закончится автообновление (иначе apt занят)
+# Ждём, пока закончится другой apt (автообновление или apt, запущенный в другом окне)
+apt_busy_list() { ps -o pid=,etime=,args= -C apt,apt-get,dpkg,unattended-upgr 2>/dev/null || true; }
 if pgrep -x 'apt|apt-get|dpkg|unattended-upgr' >/dev/null; then
-    info "Сейчас работает автообновление Ubuntu — жду его завершения (до 10 минут)..."
+    info "Сейчас на сервере работает другой apt — жду его завершения (до 10 минут):"
+    apt_busy_list | sed 's/^/          /'
+    info "Если это apt в другом окне (например, висит окно «Which services should be restarted?») — закрой его, и установка сразу продолжится."
     if ! wait_until 600 bash -c '! pgrep -x "apt|apt-get|dpkg|unattended-upgr"'; then
-        warn "Автообновление висит — останавливаю его."
+        warn "apt так и не освободился — останавливаю автообновление Ubuntu."
         systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
         pkill -x unattended-upgr 2>/dev/null || true
         sleep 5
+        if pgrep -x 'apt|apt-get|dpkg' >/dev/null; then
+            warn "apt всё ещё занят другим процессом:"
+            apt_busy_list | sed 's/^/          /'
+            warn "Заверши его в своём окне или: sudo kill <PID из списка> && sudo dpkg --configure -a"
+        fi
     fi
 fi
 systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 systemctl disable --now unattended-upgrades 2>/dev/null || true
 dpkg --configure -a >>"$INSTALL_LOG" 2>&1 || true
 
-APT_FIX="Проверь интернет на сервере (ping -c3 8.8.8.8) и выполни: dpkg --configure -a && apt-get -f install"
+APT_FIX="Если apt занят другим окном — заверши его (ps -o pid,args -C apt,apt-get,dpkg; sudo kill <PID>). Затем: sudo dpkg --configure -a && sudo apt-get -f install. Проверь интернет: ping -c3 8.8.8.8"
 run_logged "Обновление списка пакетов" "$APT_FIX" apt-get update -qq -o DPkg::Lock::Timeout=600
 run_logged "Обновление пакетов (может занять 5–10 минут)" "$APT_FIX" apt-get upgrade "${APT_OPTS[@]}"
 run_logged "Установка утилит" "$APT_FIX" \
