@@ -13,7 +13,8 @@
 #      (выбрать вручную: SELFSTEAL_TEMPLATE=filecloud|speedtest|YouTube|10gag|...)
 #   7. Config Profile для панели: /opt/remnanode/profile.json
 #   8. SSH на новый порт (старый закрывается только после проверки входа)
-#   9. итоговая проверка всего, при ошибке — подсказка, как исправить
+#   9. по желанию: SOCKS5-прокси для панели (этот сервер — посредник для другой ноды)
+#  10. итоговая проверка всего, при ошибке — подсказка, как исправить
 #
 #  Запуск:
 #   sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/aliisss288-droid/help/main/node_setup.sh)'
@@ -23,7 +24,8 @@
 #   NEW_USER, USER_PASS, SSH_PORT, SSH_PUBKEY, SECRET_KEY, NODE_PORT, PANEL_IP,
 #   PROTOCOLS="tcp,xhttp,grpc,hy2" (или "all"), SELFSTEAL=y|n, SELFSTEAL_DOMAIN,
 #   SELFSTEAL_PORT, REALITY_SNI, HY2_DOMAIN, HY2_PORT, CERT_EMAIL,
-#   TCP_PORT, XHTTP_PORT, GRPC_PORT, ASSUME_YES=1
+#   TCP_PORT, XHTTP_PORT, GRPC_PORT, SOCKS5=y|n, SOCKS_PORT, SOCKS_USER,
+#   SOCKS_NODE_ADDR (адрес:порт ноды, до которой проверить связь), ASSUME_YES=1
 # ============================================================
 set -Eeuo pipefail
 
@@ -235,7 +237,7 @@ is_our_container_process() { # is_our_container_process <pid>
     local pid=$1 id ids
     [[ -r "/proc/$pid/cgroup" ]] || return 1
     command -v docker >/dev/null || return 1
-    ids="$(docker ps -q --no-trunc --filter name=remnanode --filter name=selfsteal-caddy --filter name=certbot 2>/dev/null || true)"
+    ids="$(docker ps -q --no-trunc --filter name=remnanode --filter name=selfsteal-caddy --filter name=certbot --filter name=socks5-proxy 2>/dev/null || true)"
     for id in $ids; do
         if grep -q "$id" "/proc/$pid/cgroup"; then return 0; fi
     done
@@ -249,7 +251,7 @@ foreign_port_owners() {
         name=${entry%%:*}; pid=${entry##*:}
         if is_our_container_process "$pid"; then continue; fi
         case "$name" in
-            rw-node|rw-core|xray|caddy|node|docker-proxy|sshd|systemd|certbot) continue ;;
+            rw-node|rw-core|xray|caddy|node|docker-proxy|sshd|systemd|certbot|gost) continue ;;
         esac
         out+="$entry "
     done
@@ -463,6 +465,53 @@ if [[ -n "$CERT_EMAIL" ]] && ! valid_email "$CERT_EMAIL"; then
     die "Некорректный e-mail: $CERT_EMAIL" "Укажи настоящий адрес или оставь пустым."
 fi
 
+# ── SOCKS5 для панели (этот сервер — посредник для другой ноды) ──
+# Панель ──► socks5://логин:пароль@ЭТОТ_сервер:порт ──► другая нода (поле «Прокси URL» у той ноды)
+SOCKS_DIR="/opt/socks5"
+GOST_IMAGE="gogost/gost:3.3.0"
+head_ "SOCKS5 для панели"
+SOCKS5=${SOCKS5:-}
+SOCKS_NODE_ADDR="${SOCKS_NODE_ADDR:-}"
+if [[ -f "$SOCKS_DIR/.env" ]]; then
+    # Уже установлен — логин, пароль и порт не меняем, чтобы «Прокси URL» в панели остался рабочим
+    # shellcheck disable=SC1091
+    source "$SOCKS_DIR/.env"
+    SOCKS5=y
+    SOCKS_PORT="${SOCKS_PORT:-$OLD_SOCKS_PORT}"; SOCKS_USER="${SOCKS_USER:-$OLD_SOCKS_USER}"; SOCKS_PASS="${SOCKS_PASS:-$OLD_SOCKS_PASS}"
+    if [[ -n "${USED_TCP[$SOCKS_PORT]:-}" ]]; then
+        die "Порт SOCKS5 $SOCKS_PORT совпадает с портом «${USED_TCP[$SOCKS_PORT]}»." "Выбери для «${USED_TCP[$SOCKS_PORT]}» другой порт."
+    fi
+    USED_TCP[$SOCKS_PORT]="SOCKS5"
+    info "SOCKS5 уже установлен (порт $SOCKS_PORT, логин $SOCKS_USER) — сохраню как есть."
+else
+    echo "Нужен, если панель не может достучаться до ДРУГОЙ ноды напрямую (IP той ноды недоступен"
+    echo "из страны панели). Тогда у той ноды в панели в поле «Прокси URL» указывается SOCKS5 на"
+    echo "этом сервере, и панель ходит к ней через него. Этот сервер должен быть доступен панели."
+    ask_yn SOCKS5 "Поставить SOCKS5-прокси для панели на этом сервере?" n
+    if [[ $SOCKS5 == y ]]; then
+        while true; do
+            SOCKS_DEFAULT_PORT=$(( 20000 + RANDOM % 40000 ))
+            if [[ -z "${USED_TCP[$SOCKS_DEFAULT_PORT]:-}" ]]; then break; fi
+        done
+        ask_tcp_port SOCKS_PORT "Порт SOCKS5" "$SOCKS_DEFAULT_PORT" "SOCKS5"
+        while true; do
+            ask SOCKS_USER "Логин SOCKS5" "panel"
+            if [[ "$SOCKS_USER" =~ ^[A-Za-z0-9_]{3,32}$ ]]; then break; fi
+            warn "Логин: латиница, цифры, _ (3–32 символа)."; SOCKS_USER=""
+        done
+        # Пароль генерируется сам — только латиница и цифры, чтобы URL не ломался
+        SOCKS_PASS="${SOCKS_PASS:-$(openssl rand -hex 16)}"
+        if [[ ! "$SOCKS_PASS" =~ ^[A-Za-z0-9]{8,64}$ ]]; then
+            die "SOCKS_PASS должен быть 8–64 символа: латиница и цифры." "Задай другой пароль или не задавай — сгенерируется сам."
+        fi
+        if [[ -z "${SOCKS_NODE_ADDR}" ]]; then
+            tty_read SOCKS_NODE_ADDR "Адрес ноды, к которой панель пойдёт через этот прокси — для проверки связи (например 138.124.72.214:2222, Enter — пропустить): "
+        fi
+    fi
+fi
+SOCKS_NODE_ADDR="${SOCKS_NODE_ADDR// /}"
+if [[ -n "$SOCKS_NODE_ADDR" && "$SOCKS_NODE_ADDR" != *:* ]]; then SOCKS_NODE_ADDR="$SOCKS_NODE_ADDR:2222"; fi
+
 # ── DNS-проверки ─────────────────────────────────────────────
 head_ "Проверка DNS"
 info "IP сервера: ${SERVER_IP:-не определён}"
@@ -485,6 +534,7 @@ cat <<EOF
   Hysteria2         : $(yn $USE_HY2)${HY2_PORT:+, порт $HY2_PORT/udp, домен $HY2_DOMAIN}
   Selfsteal         : $(yn $SELFSTEAL)${SELFSTEAL_DOMAIN:+, $SELFSTEAL_DOMAIN → 127.0.0.1:$SELFSTEAL_PORT}
   E-mail (LE)       : ${CERT_EMAIL:-—}
+  SOCKS5 для панели : $(yn $SOCKS5)${SOCKS_PORT:+, порт $SOCKS_PORT/tcp, логин $SOCKS_USER}
 EOF
 if [[ $USE_REALITY == y && $SELFSTEAL == n ]]; then echo "  Reality SNI       : $REALITY_SNI"; fi
 echo
@@ -522,7 +572,7 @@ if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     while read -r cid cname; do
         [[ -n "$cid" ]] || continue
         case "$cname" in
-            remnanode|selfsteal-caddy|certbot) ;;
+            remnanode|selfsteal-caddy|certbot|socks5-proxy) ;;
             *) docker update --restart=no "$cid" >/dev/null 2>&1 || true
                FOREIGN_CONTAINERS+="$cname " ;;
         esac
@@ -731,6 +781,14 @@ if [[ $USE_XHTTP == y ]]; then ufw allow "${XHTTP_PORT}/tcp" comment 'VLESS XHTT
 if [[ $USE_GRPC  == y ]]; then ufw allow "${GRPC_PORT}/tcp"  comment 'VLESS gRPC'  >/dev/null; fi
 if [[ $USE_HY2   == y ]]; then ufw allow "${HY2_PORT}/udp"   comment 'Hysteria2'   >/dev/null; fi
 if [[ $NEED_80   == y ]]; then ufw allow 80/tcp comment 'ACME' >/dev/null; fi
+if [[ $SOCKS5 == y ]]; then
+    # SOCKS5 — только для панели (если её IP известен), иначе для всех; вход всё равно по паролю
+    if [[ -n "${PANEL_IP:-}" ]]; then
+        ufw allow from "$PANEL_IP" to any port "$SOCKS_PORT" proto tcp comment 'SOCKS5 for panel' >/dev/null
+    else
+        ufw allow "${SOCKS_PORT}/tcp" comment 'SOCKS5 for panel' >/dev/null
+    fi
+fi
 
 # ICMP → DROP (как в server_setup.sh)
 BEFORE_RULES="/etc/ufw/before.rules"
@@ -1156,6 +1214,82 @@ YAML
 fi
 
 # ============================================================
+#  9b. SOCKS5 ДЛЯ ПАНЕЛИ (этот сервер — посредник для другой ноды)
+# ============================================================
+# gost (github.com/go-gost/gost) в Docker, вход по логину и паролю.
+# Ошибки SOCKS5 не останавливают установку ноды — нода от него не зависит.
+SOCKS_OK=n
+# Доступна ли нода с этого сервера: time_connect > 0 только если TCP-соединение установилось.
+# (Код ошибки curl через прокси не годится: и «нет связи», и «нода отвечает» дают одно и то же.)
+node_tcp_ok() {
+    local t
+    t="$(curl -s -o /dev/null -w '%{time_connect}' --connect-timeout 8 --max-time 9 "telnet://$1" </dev/null 2>/dev/null || true)"
+    [[ -n "$t" && "$t" != 0 && "$t" != 0.000000 ]]
+}
+
+if [[ $SOCKS5 == y ]]; then
+    head_ "SOCKS5 для панели: порт $SOCKS_PORT"
+    mkdir -p "$SOCKS_DIR"
+    cat > "$SOCKS_DIR/docker-compose.yml" <<YAML
+services:
+  socks5:
+    image: ${GOST_IMAGE}
+    container_name: socks5-proxy
+    network_mode: host
+    restart: always
+    command: ["-L", "socks5://${SOCKS_USER}:${SOCKS_PASS}@:${SOCKS_PORT}"]
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+YAML
+    printf 'OLD_SOCKS_PORT=%q\nOLD_SOCKS_USER=%q\nOLD_SOCKS_PASS=%q\n' "$SOCKS_PORT" "$SOCKS_USER" "$SOCKS_PASS" > "$SOCKS_DIR/.env"
+    chmod 600 "$SOCKS_DIR/docker-compose.yml" "$SOCKS_DIR/.env"
+
+    ensure_image "$GOST_IMAGE"
+    SOCKS_RC=0
+    docker compose -f "$SOCKS_DIR/docker-compose.yml" up -d --force-recreate >>"$INSTALL_LOG" 2>&1 || SOCKS_RC=$?
+    if (( SOCKS_RC != 0 )) || ! wait_until 20 tcp_listen "$SOCKS_PORT"; then
+        echo "------ логи SOCKS5 ------"; docker logs --tail 15 socks5-proxy 2>&1 || true; echo "-------------------------"
+        warn "SOCKS5 не запустился — нода от этого не зависит. Логи: docker logs socks5-proxy"
+    else
+        PROXY_LOCAL="socks5h://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${SOCKS_PORT}"
+        if curl -s -o /dev/null --max-time 10 -x "socks5h://${SOCKS_USER}:wrong-password@127.0.0.1:${SOCKS_PORT}" https://www.google.com; then
+            # Пускает без правильного пароля — открытый прокси опасен, выключаем
+            docker compose -f "$SOCKS_DIR/docker-compose.yml" down >/dev/null 2>&1 || true
+            warn "SOCKS5 принял неверный пароль — остановлен из соображений безопасности. Пришли: docker logs socks5-proxy"
+        else
+            SOCKS_OK=y
+            success "SOCKS5 запущен, чужой пароль не принимается."
+            if curl -s -o /dev/null --max-time 15 -x "$PROXY_LOCAL" https://www.google.com; then
+                success "Через прокси открывается интернет."
+            else
+                warn "Через прокси не открылся google.com — проверь выход в интернет у этого сервера."
+            fi
+            SOCKS_NODE_STATUS=""
+            if [[ -n "$SOCKS_NODE_ADDR" ]]; then
+                if node_tcp_ok "$SOCKS_NODE_ADDR"; then
+                    SOCKS_NODE_STATUS="доступна"
+                    success "С этого сервера нода $SOCKS_NODE_ADDR доступна — прокси подходит."
+                else
+                    SOCKS_NODE_STATUS="НЕ доступна"
+                    warn "С этого сервера нода $SOCKS_NODE_ADDR НЕ доступна — такой прокси не поможет."
+                    warn "Поставь SOCKS5 на другой сервер, с которого нода открывается."
+                fi
+            fi
+            SOCKS_URL="socks5://${SOCKS_USER}:${SOCKS_PASS}@${SERVER_IP:-<IP_этого_сервера>}:${SOCKS_PORT}"
+            {
+            echo "===== SOCKS5 для панели — $(date '+%F %T') ====="
+            echo "Прокси URL : ${SOCKS_URL}"
+            echo "Доступ     : ${PANEL_IP:-все (по паролю)}${PANEL_HOST:+ = $PANEL_HOST}"
+            if [[ -n "$SOCKS_NODE_ADDR" ]]; then echo "Нода       : $SOCKS_NODE_ADDR — $SOCKS_NODE_STATUS"; fi
+            } > /root/socks5-proxy.txt
+            chmod 600 /root/socks5-proxy.txt
+        fi
+    fi
+fi
+
+
+# ============================================================
 #  10. CONFIG PROFILE ДЛЯ ПАНЕЛИ
 # ============================================================
 head_ "Config Profile для панели"
@@ -1410,6 +1544,10 @@ if [[ $SELFSTEAL == y ]]; then
     check "Сайт отвечает на 127.0.0.1:$SELFSTEAL_PORT" "docker logs --tail 30 selfsteal-caddy" caddy_https_ok
 fi
 check "Профиль для панели создан" "запусти скрипт ещё раз" jq -e '.inbounds | length > 0' "$NODE_DIR/profile.json"
+if [[ $SOCKS5 == y ]]; then
+    check "SOCKS5 для панели работает" "docker logs --tail 30 socks5-proxy" \
+        bash -c "[[ \$(docker inspect -f '{{.State.Running}}' socks5-proxy) == true ]]"
+fi
 if [[ $UFW_OK == y ]]; then
     check "UFW включён" "ufw --force enable" ufw_active
 fi
@@ -1441,6 +1579,10 @@ fi
 if [[ $SELFSTEAL == y ]]; then echo "Selfsteal       : ${SELFSTEAL_DOMAIN} → 127.0.0.1:${SELFSTEAL_PORT} (${CADDY_DIR})"; fi
 echo "Нода            : ${NODE_DIR}/docker-compose.yml"
 echo "Профиль панели  : ${NODE_DIR}/profile.json"
+if [[ $SOCKS_OK == y && -f /root/socks5-proxy.txt ]]; then
+    echo "SOCKS5 (Прокси URL для другой ноды в панели):"
+    grep -E '^Прокси URL' /root/socks5-proxy.txt | sed 's/^Прокси URL *: */    /' || true
+fi
 } > "$SUMMARY_FILE"
 chmod 600 "$SUMMARY_FILE"
 
@@ -1453,7 +1595,8 @@ cat "$NODE_DIR/profile.json"
 echo "────────────────────────────────────────────────────────────"
 echo
 echo -e "${BOLD}В панели осталось:${RESET}"
-echo "  1. Config Profiles → создать профиль и вставить JSON выше (или: cat ${NODE_DIR}/profile.json)."
+echo "  1. Config Profiles → создать профиль и вставить JSON выше (или: sudo cat ${NODE_DIR}/profile.json)."
+echo "     Файл читается только через sudo — в нём приватный ключ Reality."
 echo "  2. Nodes → у этой ноды выбрать профиль и отметить inbound'ы."
 echo "  3. Hosts → создать хост для каждого inbound'а."
 if [[ $SELFSTEAL == y ]]; then
@@ -1466,5 +1609,5 @@ if (( CHECK_FAILS > 0 )); then
 else
     success "Все проверки пройдены."
 fi
-echo "Итог сохранён в ${SUMMARY_FILE}, полный лог: ${INSTALL_LOG}"
+echo "Итог: sudo cat ${SUMMARY_FILE}   Полный лог: sudo tail -100 ${INSTALL_LOG}"
 sleep 1
