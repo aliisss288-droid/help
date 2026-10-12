@@ -30,6 +30,10 @@
 set -Eeuo pipefail
 
 SCRIPT_URL="https://raw.githubusercontent.com/aliisss288-droid/help/main/node_setup.sh"
+# Домен (или IP) панели по умолчанию: в вопросе про панель Enter подставит его.
+# Поменяй здесь один раз, если панель переедет. Пусто — спрашивать каждый раз.
+PANEL_DEFAULT="panel.freeinternet.nimeline.com"
+ANSWERS_FILE="/root/.node_setup_answers"   # ответы прошлого запуска на этом сервере
 NODE_DIR="/opt/remnanode"
 CERTBOT_DIR="/opt/certbot"
 CADDY_DIR="/opt/caddy"
@@ -324,6 +328,24 @@ CURRENT_SSH_PORTS="${CURRENT_SSH_PORTS:-22}"
 # ============================================================
 #  1. СБОР ПАРАМЕТРОВ
 # ============================================================
+# Повторный запуск на этом же сервере: можно взять все прошлые ответы и ничего не вводить заново
+REUSE=n
+if [[ -f "$ANSWERS_FILE" ]]; then
+    head_ "Ответы прошлого запуска"
+    info "На этом сервере сохранены ответы прошлой установки ($ANSWERS_FILE)."
+    REUSE=""   # пусто — чтобы ask_yn действительно задал вопрос
+    ask_yn REUSE "Использовать их? (n — ввести всё заново)" y
+    if [[ $REUSE == y ]]; then
+        # Переменные окружения, заданные при запуске, важнее сохранённых
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[A-Z_][A-Z0-9_]*= ]] || continue
+            name="${line%%=*}"
+            if [[ -z "${!name+x}" ]]; then eval "$line"; fi
+        done < "$ANSWERS_FILE"
+        success "Ответы загружены — останется только проверить итог и подтвердить."
+    fi
+fi
+
 head_ "Пользователь и SSH"
 
 while true; do
@@ -333,7 +355,10 @@ while true; do
 done
 
 _pass2=""
-if [[ -z "${USER_PASS:-}" ]]; then
+# При повторном запуске с прошлыми ответами пароль существующего пользователя не трогаем
+SKIP_PASS=n
+if [[ $REUSE == y ]] && id "$NEW_USER" &>/dev/null; then SKIP_PASS=y; fi
+if [[ $SKIP_PASS == n && -z "${USER_PASS:-}" ]]; then
     while true; do
         if id "$NEW_USER" &>/dev/null; then
             tty_read USER_PASS "Пароль для '$NEW_USER' (для sudo; Enter — оставить текущий): " -s
@@ -374,13 +399,21 @@ done
 ask_tcp_port NODE_PORT "Node Port (порт API ноды, как в панели)" "2222" "Node API"
 
 # Панель: можно IP или домен. UFW понимает только IP, поэтому домен переводим в IP.
+# Спрашивается ОДИН раз и используется везде: Node Port и SOCKS5 открываются только для неё.
 PANEL_HOST=""
 if [[ -z "${PANEL_IP+x}" ]]; then
     while true; do
-        tty_read PANEL_IP "IP или домен панели — открыть Node Port только для неё (Enter — для всех): "
+        if [[ -n "$PANEL_DEFAULT" ]]; then
+            tty_read PANEL_IP "Домен или IP панели [$PANEL_DEFAULT] (Enter — он, «-» — открыть для всех): "
+            if [[ -z "$PANEL_IP" ]]; then PANEL_IP="$PANEL_DEFAULT"; elif [[ "$PANEL_IP" == "-" ]]; then PANEL_IP=""; fi
+        else
+            tty_read PANEL_IP "Домен или IP панели — открыть Node Port только для неё (Enter — для всех): "
+        fi
+        PANEL_INPUT="$PANEL_IP"
         if normalize_panel; then break; fi
     done
 else
+    PANEL_INPUT="$PANEL_IP"
     normalize_panel || die "PANEL_IP=$PANEL_IP — не удалось определить IP панели." \
         "Укажи IP вида 1.2.3.4, домен панели без прокси Cloudflare или оставь пустым."
 fi
@@ -471,7 +504,6 @@ SOCKS_DIR="/opt/socks5"
 GOST_IMAGE="gogost/gost:3.3.0"
 head_ "SOCKS5 для панели"
 SOCKS5=${SOCKS5:-}
-SOCKS_NODE_ADDR="${SOCKS_NODE_ADDR:-}"
 if [[ -f "$SOCKS_DIR/.env" ]]; then
     # Уже установлен — логин, пароль и порт не меняем, чтобы «Прокси URL» в панели остался рабочим
     # shellcheck disable=SC1091
@@ -489,28 +521,58 @@ else
     echo "этом сервере, и панель ходит к ней через него. Этот сервер должен быть доступен панели."
     ask_yn SOCKS5 "Поставить SOCKS5-прокси для панели на этом сервере?" n
     if [[ $SOCKS5 == y ]]; then
-        while true; do
-            SOCKS_DEFAULT_PORT=$(( 20000 + RANDOM % 40000 ))
-            if [[ -z "${USED_TCP[$SOCKS_DEFAULT_PORT]:-}" ]]; then break; fi
-        done
-        ask_tcp_port SOCKS_PORT "Порт SOCKS5" "$SOCKS_DEFAULT_PORT" "SOCKS5"
-        while true; do
-            ask SOCKS_USER "Логин SOCKS5" "panel"
-            if [[ "$SOCKS_USER" =~ ^[A-Za-z0-9_-]{3,32}$ ]]; then break; fi
-            warn "Логин: латиница, цифры, _ и - (3–32 символа)."; SOCKS_USER=""
-        done
-        # Пароль генерируется сам — только латиница и цифры, чтобы URL не ломался
+        # Порт, логин и пароль — автоматически (вводить нечего). Можно задать заранее: SOCKS_PORT, SOCKS_USER, SOCKS_PASS
+        if [[ -z "${SOCKS_PORT:-}" ]]; then
+            while true; do
+                SOCKS_PORT=$(( 20000 + RANDOM % 40000 ))
+                if [[ -z "${USED_TCP[$SOCKS_PORT]:-}" ]] && ! tcp_listen "$SOCKS_PORT"; then break; fi
+            done
+        fi
+        valid_port "$SOCKS_PORT" || die "SOCKS_PORT=$SOCKS_PORT — некорректный порт."
+        if [[ -n "${USED_TCP[$SOCKS_PORT]:-}" ]]; then
+            die "Порт SOCKS5 $SOCKS_PORT совпадает с портом «${USED_TCP[$SOCKS_PORT]}»." "Задай другой SOCKS_PORT или не задавай — выберется сам."
+        fi
+        USED_TCP[$SOCKS_PORT]="SOCKS5"
+        SOCKS_USER="${SOCKS_USER:-proxy$(openssl rand -hex 3)}"
+        # Только латиница и цифры, чтобы URL не ломался
         SOCKS_PASS="${SOCKS_PASS:-$(openssl rand -hex 16)}"
-        if [[ ! "$SOCKS_PASS" =~ ^[A-Za-z0-9]{8,64}$ ]]; then
-            die "SOCKS_PASS должен быть 8–64 символа: латиница и цифры." "Задай другой пароль или не задавай — сгенерируется сам."
+        if [[ ! "$SOCKS_USER" =~ ^[A-Za-z0-9_-]{3,32}$ || ! "$SOCKS_PASS" =~ ^[A-Za-z0-9]{8,64}$ ]]; then
+            die "SOCKS_USER/SOCKS_PASS: только латиница и цифры (логин 3–32, пароль 8–64 символа)." "Не задавай их — сгенерируются сами."
         fi
-        if [[ -z "${SOCKS_NODE_ADDR}" ]]; then
-            tty_read SOCKS_NODE_ADDR "Адрес ноды, к которой панель пойдёт через этот прокси — для проверки связи (например 138.124.72.214:2222, Enter — пропустить): "
-        fi
+        info "Порт $SOCKS_PORT, логин $SOCKS_USER, пароль — сгенерированы автоматически."
     fi
 fi
-SOCKS_NODE_ADDR="${SOCKS_NODE_ADDR// /}"
-if [[ -n "$SOCKS_NODE_ADDR" && "$SOCKS_NODE_ADDR" != *:* ]]; then SOCKS_NODE_ADDR="$SOCKS_NODE_ADDR:2222"; fi
+# Необязательная проверка: достаёт ли этот сервер до ноды, которой нужен прокси.
+# Ловим две частые ошибки: указан адрес панели или адрес самого этого сервера.
+socks_node_addr_ok() {
+    SOCKS_NODE_ADDR="${SOCKS_NODE_ADDR// /}"
+    if [[ -z "$SOCKS_NODE_ADDR" ]]; then return 0; fi
+    if [[ "$SOCKS_NODE_ADDR" != *:* ]]; then SOCKS_NODE_ADDR="$SOCKS_NODE_ADDR:2222"; fi
+    local h="${SOCKS_NODE_ADDR%:*}"
+    if [[ -n "$PANEL_IP" && ( "$h" == "$PANEL_IP" || "$h" == "${PANEL_HOST:-}" ) ]]; then
+        warn "$h — это адрес ПАНЕЛИ. Здесь нужен адрес НОДЫ, до которой панель не достаёт (её IP:Node Port)."
+        return 1
+    fi
+    if [[ -n "$SERVER_IP" && "$h" == "$SERVER_IP" ]]; then
+        warn "$h — это адрес ЭТОГО сервера. Прокси на той же ноде не поможет: если панель не достаёт до ноды,"
+        warn "она не достанет и до прокси на ней. Ставь SOCKS5 на ДРУГОЙ сервер, до которого панель достаёт."
+        return 1
+    fi
+    return 0
+}
+if [[ $SOCKS5 == y ]]; then
+    if [[ -z "${SOCKS_NODE_ADDR+x}" ]]; then
+        echo "Прокси ставится на сервер-ПОСРЕДНИК (этот), а нужен он ДРУГОЙ ноде — той, до которой панель не достаёт."
+        while true; do
+            tty_read SOCKS_NODE_ADDR "IP:порт той ноды, например 138.124.72.214:2222 — проверю, видит ли её этот сервер (Enter — пропустить): "
+            if socks_node_addr_ok; then break; fi
+        done
+    elif ! socks_node_addr_ok; then
+        warn "SOCKS_NODE_ADDR=$SOCKS_NODE_ADDR — проверка связи с нодой пропущена."
+        SOCKS_NODE_ADDR=""
+    fi
+fi
+SOCKS_NODE_ADDR="${SOCKS_NODE_ADDR:-}"
 
 # ── DNS-проверки ─────────────────────────────────────────────
 head_ "Проверка DNS"
@@ -540,8 +602,19 @@ if [[ $USE_REALITY == y && $SELFSTEAL == n ]]; then echo "  Reality SNI       : 
 echo
 if [[ "${ASSUME_YES:-}" != 1 ]]; then
     GO=""; ask_yn GO "Всё верно, начинаем? Дальше всё пойдёт автоматически" y
-    [[ $GO == y ]] || die "Отменено пользователем."
+    [[ $GO == y ]] || die "Отменено пользователем." "Запусти скрипт снова; на вопрос «Использовать прошлые ответы?» ответь n, чтобы ввести всё заново."
 fi
+
+# Запоминаем ответы для повторного запуска на этом сервере (пароль пользователя не сохраняется).
+# Файл только для root: в нём SECRET_KEY, как и в docker-compose.yml ноды.
+{
+    for v in NEW_USER SSH_PORT SSH_PUBKEY SECRET_KEY NODE_PORT PROTOCOLS TCP_PORT XHTTP_PORT GRPC_PORT \
+             HY2_PORT HY2_DOMAIN SELFSTEAL SELFSTEAL_DOMAIN SELFSTEAL_PORT REALITY_SNI CERT_EMAIL SOCKS5 SOCKS_NODE_ADDR; do
+        if [[ -n "${!v+x}" ]]; then printf '%s=%q\n' "$v" "${!v}"; fi
+    done
+    printf 'PANEL_IP=%q\n' "${PANEL_INPUT:-}"
+} > "$ANSWERS_FILE"
+chmod 600 "$ANSWERS_FILE"
 
 # С этого момента обрыв SSH не убивает установку:
 # SIGHUP игнорируется, весь вывод дублируется в лог (tee не падает, если терминал пропал).
@@ -656,18 +729,24 @@ ensure_image() {
         "Проверь интернет на сервере (curl -I https://registry-1.docker.io). При лимите Docker Hub подожди ~6 часов или выполни: docker login"
 }
 
-# Ждём, пока закончится другой apt (автообновление или apt, запущенный в другом окне)
-apt_busy_list() { ps -o pid=,etime=,args= -C apt,apt-get,dpkg,unattended-upgr 2>/dev/null || true; }
-if pgrep -x 'apt|apt-get|dpkg|unattended-upgr' >/dev/null; then
+# Ждём, пока закончится другой apt (автообновление или apt, запущенный в другом окне).
+# Смотрим по командной строке, а не по имени: фоновый помощник
+# «unattended-upgrade-shutdown --wait-for-signal» тоже называется unattended-upgr,
+# но работает постоянно и apt не занимает — его ждать не нужно.
+APT_BUSY_RE='(^|/)(apt|apt-get|aptitude|dpkg)( |$)|/usr/bin/unattended-upgrade( |$)'
+apt_busy()      { pgrep -f "$APT_BUSY_RE" >/dev/null 2>&1; }
+apt_free()      { ! apt_busy; }
+apt_busy_list() { pgrep -af "$APT_BUSY_RE" 2>/dev/null || true; }
+if apt_busy; then
     info "Сейчас на сервере работает другой apt — жду его завершения (до 10 минут):"
     apt_busy_list | sed 's/^/          /'
     info "Если это apt в другом окне (например, висит окно «Which services should be restarted?») — закрой его, и установка сразу продолжится."
-    if ! wait_until 600 bash -c '! pgrep -x "apt|apt-get|dpkg|unattended-upgr"'; then
+    if ! wait_until 600 apt_free; then
         warn "apt так и не освободился — останавливаю автообновление Ubuntu."
         systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
-        pkill -x unattended-upgr 2>/dev/null || true
+        pkill -f '/usr/bin/unattended-upgrade( |$)' 2>/dev/null || true
         sleep 5
-        if pgrep -x 'apt|apt-get|dpkg' >/dev/null; then
+        if apt_busy; then
             warn "apt всё ещё занят другим процессом:"
             apt_busy_list | sed 's/^/          /'
             warn "Заверши его в своём окне или: sudo kill <PID из списка> && sudo dpkg --configure -a"
