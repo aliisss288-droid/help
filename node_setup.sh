@@ -1001,6 +1001,7 @@ if [[ -s "$NODE_DIR/docker-compose.yml" ]]; then
     cp "$NODE_DIR/docker-compose.yml" "$NODE_DIR/docker-compose.yml.bak.$(date +%s)"
 fi
 
+mkdir -p /var/log/remnanode
 {
 cat <<YAML
 services:
@@ -1019,10 +1020,11 @@ services:
     environment:
       NODE_PORT: "${NODE_PORT}"
       SECRET_KEY: "${SECRET_KEY}"
+    volumes:
+      - '/var/log/remnanode:/var/log/remnanode'
 YAML
 if [[ $USE_HY2 == y ]]; then
 cat <<YAML
-    volumes:
       - '${CERTBOT_DIR}/certs:/etc/letsencrypt:ro'
 YAML
 fi
